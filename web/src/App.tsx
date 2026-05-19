@@ -447,12 +447,12 @@ export default function App() {
           <Menu />
         </Button>
 
-        <span
-          className="font-mondwest uppercase font-bold text-[0.95rem] leading-[0.95] tracking-[0.05em] text-midground blend-lighter"
+        <Typography
+          className="font-bold text-[0.95rem] leading-[0.95] tracking-[0.05em] text-midground"
           style={{ mixBlendMode: "plus-lighter" }}
         >
           {t.app.brand}
-        </span>
+        </Typography>
       </header>
 
       {mobileOpen && (
@@ -497,14 +497,14 @@ export default function App() {
               <div className="flex items-center gap-2">
                 <PluginSlot name="header-left" />
 
-                <span
-                  className="font-mondwest uppercase font-bold text-[1.125rem] leading-[0.95] tracking-[0.0525rem] text-midground blend-lighter"
+                <Typography
+                  className="font-bold text-[1.125rem] leading-[0.95] tracking-[0.0525rem] text-midground"
                   style={{ mixBlendMode: "plus-lighter" }}
                 >
                   Hermes
                   <br />
                   Agent
-                </span>
+                </Typography>
               </div>
 
               <Button
