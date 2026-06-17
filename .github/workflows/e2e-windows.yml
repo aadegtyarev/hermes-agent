@@ -169,11 +169,7 @@ jobs:
           Write-Host "Isolated install dir ready: $installDir"
 
       # ── Run the headed installer + AHK helper ───────────────────────
-      # For the first run we deliberately do NOT click the "Install Hermes"
-      # button.  AHK waits, captures the window, and exits.  A maintainer
-      # reviews the screenshots/recording, supplies the button coordinates,
-      # and we then update the AHK script to click them.
-      - name: Launch Hermes-Setup.exe and capture welcome screen
+      - name: Launch Hermes-Setup.exe and install it
         shell: pwsh
         timeout-minutes: 5
         run: |
@@ -212,16 +208,17 @@ jobs:
           #Requires AutoHotkey v2.0
           #SingleInstance Force
 
-          ;;;;;;;;;;;
+          ;
           ; enable click animation
-          ;;;;;;;;;;;
+          ;
 
           DllCall("SystemParametersInfo", UInt, 0x101D, UInt, 0, UInt, 1, UInt, 0) ;SPI_SETMOUSESONAR ON
 
-          OnExit, ExitSub
+          OnExit(ExitSub)
           ExitSub:
             DllCall("SystemParametersInfo", UInt, 0x101D, UInt, 0, UInt, 0, UInt, 0) ;SPI_SETMOUSESONAR OFF
             ExitApp
+
 
           ~LButton::
           Send {Ctrl}
