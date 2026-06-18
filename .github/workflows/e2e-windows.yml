@@ -192,27 +192,26 @@ jobs:
           Write-Host "ffmpeg recording started (pid $($ffmpeg.Id))"
 
           try {
-          # Launch the real installer (headed).
-          $proc = Start-Process -FilePath $installer -PassThru -NoNewWindow
-          $proc.Id | Out-File installer.pid
+            # Launch the real installer
+            $proc = Start-Process -FilePath $installer -PassThru -NoNewWindow
+            $proc.Id | Out-File installer.pid
 
+            $ahkProc = Start-Process -FilePath ".\test-bins\autohotkey\AutoHotkey64.exe" `
+              -ArgumentList "$env:INSTALL_DIR\e2e\windows\install-hermes-desktop.ahk" -PassThru -NoNewWindow `
+              -RedirectStandardOutput ahk-stdout.log -RedirectStandardError ahk-stderr.log
 
-          $ahkProc = Start-Process -FilePath ".\test-bins\autohotkey\AutoHotkey64.exe" `
-            -ArgumentList '"$env:INSTALL_DIR\e2e\windows\install-hermes-desktop.ahk"' -PassThru -NoNewWindow `
-            -RedirectStandardOutput ahk-stdout.log -RedirectStandardError ahk-stderr.log
+            # Wait for AHK helper to finish
+            $ahkProc | Wait-Process -Timeout 240 -ErrorAction SilentlyContinue
+            if (-not $ahkProc.HasExited) {
+              Write-Host "AHK helper is still running; stopping it"
+              Stop-Process -Id $ahkProc.Id -Force -ErrorAction SilentlyContinue
+            }
 
-          # Wait for AHK helper to finish
-          $ahkProc | Wait-Process -Timeout 240 -ErrorAction SilentlyContinue
-          if (-not $ahkProc.HasExited) {
-            Write-Host "AHK helper is still running; stopping it"
-            Stop-Process -Id $ahkProc.Id -Force -ErrorAction SilentlyContinue
-          }
-
-          # Leave the installer running briefly for the recording, then stop it.
-          Start-Sleep -Seconds 5
-          if ($proc -and -not $proc.HasExited) {
-            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-          }
+            # Leave the installer running briefly for the recording, then stop it.
+            Start-Sleep -Seconds 5
+            if ($proc -and -not $proc.HasExited) {
+              Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+            }
           }
           finally {
             # Gracefully stop ffmpeg by writing 'q' to its LIVE stdin pipe, so
