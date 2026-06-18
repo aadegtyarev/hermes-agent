@@ -4,28 +4,31 @@
 ; enable click animation ;;;;;;;;;;;
 
 
-DllCall("SystemParametersInfo", UInt, 0x101D, UInt, 0, UInt, 1, UInt, 0) ;SPI_SETMOUSESONAR ON
+DllCall("SystemParametersInfo", "UInt", 0x101D, "UInt", 0, "UInt", 1, "UInt", 0) ;SPI_SETMOUSESONAR ON
 
 OnExit(ExitSub)
-ExitSub:
-DllCall("SystemParametersInfo", UInt, 0x101D, UInt, 0, UInt, 0, UInt, 0) ;SPI_SETMOUSESONAR OFF
-ExitApp
+ExitSub(*) {
+    DllCall("SystemParametersInfo", "UInt", 0x101D, "UInt", 0, "UInt", 0, "UInt", 0) ;SPI_SETMOUSESONAR OFF
+}
 
 
-~LButton::
-Send {Ctrl}
-return
+~LButton::{
+    Send("{Ctrl down}")
+    Send("{Ctrl up}")
+}
 
-~LButton UP::
-Send {Ctrl}
-return
+~LButton Up::{
+    Send("{Ctrl down}")
+    Send("{Ctrl up}")
+}
 ;;;;;;;;;;;
 
 
 ; Wait for the Hermes installer window to appear.
 winTitle := "Hermes"
-if not WinWait(winTitle,, 30)
-{
+try {
+    WinWait(winTitle, , 30)
+} catch {
     FileAppend("ERROR: Hermes installer window did not appear within 30s`n", "ahk.log")
     ExitApp(1)
 }
