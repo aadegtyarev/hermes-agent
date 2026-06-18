@@ -89,13 +89,6 @@ jobs:
           Copy-Item -Path $installer -Destination 'Hermes-Setup.exe' -Force
           Write-Host "Normalized installer: Hermes-Setup.exe (from $installer)"
 
-      - name: Upload installer artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: hermes-installer-cache-${{ runner.os }}-${{ hashFiles('package-lock.json', 'apps/bootstrap-installer/**', '!apps/bootstrap-installer/src-tauri/target/**') }}
-          path: Hermes-Setup.exe
-          if-no-files-found: error
-
   e2e:
     name: Run installer test
     needs: build-installer
@@ -113,10 +106,12 @@ jobs:
         with:
           path: source
 
-      - name: Download installer artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - name: Restore installer from build cache
+        id: installer-cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
         with:
-          name: hermes-installer-cache-${{ runner.os }}-${{ hashFiles('source/package-lock.json', 'source/apps/bootstrap-installer/**', '!source/apps/bootstrap-installer/src-tauri/target/**') }}
+          path: Hermes-Setup.exe
+          key: hermes-installer-cache-${{ runner.os }}-${{ hashFiles('source/package-lock.json', 'source/apps/bootstrap-installer/**', '!source/apps/bootstrap-installer/src-tauri/target/**') }}
 
       - name: Restore cached test tools
         id: test-tools-cache
@@ -286,7 +281,7 @@ jobs:
         id: upload-recording
         if: always()
         with:
-          name: screen-recording-${{ github.event.pull_request.head.sha }}
+          name: screen-recording-${{ github.sha }}
           path: recording.mkv
           retention-days: 1
           archive: false
@@ -297,7 +292,7 @@ jobs:
         id: upload-gif
         if: always()
         with:
-          name: screen-recording-gif-${{ github.event.pull_request.head.sha }}
+          name: screen-recording-gif-${{ github.sha }}
           path: recording.gif
           retention-days: 1
           archive: false
@@ -309,11 +304,11 @@ jobs:
           MKV_URL: ${{ steps.upload-recording.outputs.artifact-url }}
           GIF_URL: ${{ steps.upload-gif.outputs.artifact-url }}
         run: |
-          "## E2E screen recording" >> $env:GITHUB_STEP_SUMMARY
-          "" >> $env:GITHUB_STEP_SUMMARY
-          "[download recording.mkv]($($env.MKV_URL))" >> $env:GITHUB_STEP_SUMMARY
-          "" >> $env:GITHUB_STEP_SUMMARY
-          "![recording.gif]($($env.GIF_URL))" >> $env:GITHUB_STEP_SUMMARY
+          Add-Content $env:GITHUB_STEP_SUMMARY "## Installer screen recording"
+          Add-Content $env:GITHUB_STEP_SUMMARY ""
+          Add-Content $env:GITHUB_STEP_SUMMARY "[download recording.mkv]($env:MKV_URL)"
+          Add-Content $env:GITHUB_STEP_SUMMARY ""
+          Add-Content $env:GITHUB_STEP_SUMMARY "![recording.gif]($env:GIF_URL)"
 
       - name: Upload AHK logs and script
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
