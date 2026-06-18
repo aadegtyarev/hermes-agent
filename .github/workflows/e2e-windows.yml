@@ -201,7 +201,7 @@ jobs:
               -RedirectStandardOutput ahk-stdout.log -RedirectStandardError ahk-stderr.log
 
             # Wait for AHK helper to finish
-            $ahkProc | Wait-Process -Timeout 240 -ErrorAction SilentlyContinue
+            $ahkProc | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue
             if (-not $ahkProc.HasExited) {
               Write-Host "AHK helper is still running; stopping it"
               Stop-Process -Id $ahkProc.Id -Force -ErrorAction SilentlyContinue
