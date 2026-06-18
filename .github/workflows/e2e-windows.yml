@@ -52,12 +52,6 @@ jobs:
         if: steps.installer-cache.outputs.cache-hit != 'true'
         run: npm ci
 
-      - name: Cache Rust targets
-        if: steps.installer-cache.outputs.cache-hit != 'true'
-        uses: Swatinem/rust-cache@c106961feec855ef5a58494c5a2a31c9d80429a9
-        with:
-          workspaces: apps/bootstrap-installer/src-tauri
-
       - name: Build installer
         if: steps.installer-cache.outputs.cache-hit != 'true'
         run: npm run tauri:build
@@ -120,7 +114,7 @@ jobs:
           path: source
 
       - name: Download installer artifact
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: hermes-installer-cache-${{ runner.os }}-${{ hashFiles('source/package-lock.json', 'source/apps/bootstrap-installer/**', '!source/apps/bootstrap-installer/src-tauri/target/**') }}
 
@@ -285,14 +279,13 @@ jobs:
         id: upload-recording
         if: always()
         with:
-          name: screen-recording
+          name: screen-recording-${{ github.event.pull_request.head.sha }}
           path: recording.mkv
-          if-no-files-found: ignore
+          retention-days: 1
           archive: false
           overwrite: true
 
       - name: Link screen recording in job summary
-        if: steps.upload-recording.outputs.artifact-url != ''
         shell: pwsh
         env:
           ARTIFACT_URL: ${{ steps.upload-recording.outputs.artifact-url }}
@@ -300,9 +293,10 @@ jobs:
           "## E2E screen recording" >> $env:GITHUB_STEP_SUMMARY
           "" >> $env:GITHUB_STEP_SUMMARY
           "[download recording.mkv]($($env:ARTIFACT_URL))" >> $env:GITHUB_STEP_SUMMARY
+          "$($env:ARTIFACT_URL)" >> $env:GITHUB_STEP_SUMMARY
 
       - name: Upload AHK logs and script
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
           name: ahk-discovery
