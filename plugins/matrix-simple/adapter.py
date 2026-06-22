@@ -180,7 +180,7 @@ class MatrixSimpleAdapter(BasePlatformAdapter):
 
                         from gateway.session import SessionSource
                         source = SessionSource(
-                            platform_name="matrix-simple",
+                            platform=self.platform,
                             chat_id=rid,
                             user_id=sender,
                             user_name=sender_name,
@@ -192,7 +192,7 @@ class MatrixSimpleAdapter(BasePlatformAdapter):
                             message_id=eid,
                             raw_message=ev,
                         )
-                        await self._dispatch_event(event)
+                        await self.handle_message(event)
 
             except Exception as e:
                 logger.error(f"Matrix sync error: {e}")
