@@ -40,6 +40,16 @@ from agent.model_metadata import estimate_request_tokens_rough
 
 logger = logging.getLogger(__name__)
 
+# Stable marker the gateway matches on to re-tag the auto-compaction lifecycle
+# status as ``kind="compacting"`` (tui_gateway/server.py::_status_update), so
+# drivers like the desktop app can show an explicit "Summarizing…" indicator
+# instead of the transcript appearing to silently reset. Keep the marker phrase
+# intact if you reword COMPACTION_STATUS.
+COMPACTION_STATUS_MARKER = "Compacting context"
+COMPACTION_STATUS = (
+    f"🗜️ {COMPACTION_STATUS_MARKER} — summarizing earlier conversation so I can continue..."
+)
+
 
 def _compression_lock_holder(agent: Any) -> str:
     """Build a unique holder id for the lock: pid:tid:agent-instance:uuid.
@@ -324,9 +334,7 @@ def compress_context(
         f"{approx_tokens:,}" if approx_tokens else "unknown", agent.model,
         focus_topic,
     )
-    agent._emit_status(
-        "🗜️ Compacting context — summarizing earlier conversation so I can continue..."
-    )
+    agent._emit_status(COMPACTION_STATUS)
 
     # ── Compression lock ────────────────────────────────────────────────
     # Atomic, state.db-backed lock per session_id.  Without this, two
@@ -595,6 +603,20 @@ def compress_context(
             force=True,
         )
 
+    # Emit session:compress event so hooks (e.g. MemPalace sync) can ingest
+    # the completed old session before its details are lost.
+    _old_sid_for_event = locals().get("old_session_id")
+    if getattr(agent, "event_callback", None):
+        try:
+            agent.event_callback("session:compress", {
+                "platform": agent.platform or "",
+                "session_id": agent.session_id,
+                "old_session_id": _old_sid_for_event or "",
+                "compression_count": agent.context_compressor.compression_count,
+            })
+        except Exception as e:
+            logger.debug("event_callback error on session:compress: %s", e)
+
     # Keep the post-compression rough estimate for diagnostics, but do not
     # treat it as provider-reported prompt usage. Schema-heavy rough estimates
     # can remain above threshold even after the next real API request fits.
@@ -799,6 +821,8 @@ def try_shrink_image_parts_in_messages(
 
 
 __all__ = [
+    "COMPACTION_STATUS",
+    "COMPACTION_STATUS_MARKER",
     "check_compression_model_feasibility",
     "replay_compression_warning",
     "compress_context",

@@ -40,6 +40,14 @@ _NUMERIC_TOPIC_RE = _TELEGRAM_TOPIC_TARGET_RE
 # downstream adapters (signal, etc.) expect.
 _PHONE_PLATFORMS = frozenset({"photon", "signal", "sms", "whatsapp"})
 _E164_TARGET_RE = re.compile(r"^\s*\+(\d{7,15})\s*$")
+# WhatsApp JIDs: group chats (<digits>@g.us), individual users
+# (<phone>@s.whatsapp.net), linked identities (<id>@lid), and broadcast /
+# newsletter chats. These are explicit native targets the bridge accepts
+# verbatim — they must NOT fall through to home-channel resolution.
+_WHATSAPP_JID_RE = re.compile(
+    r"^\s*[\w-]+@(?:g\.us|s\.whatsapp\.net|lid|broadcast|newsletter)\s*$",
+    re.IGNORECASE,
+)
 # Email addresses — a valid email like "user@domain.com" should be treated as
 # an explicit target for the email platform, not fall through to channel-name
 # resolution which has no way to resolve a raw address.
@@ -255,6 +263,13 @@ def _handle_react(args, remove=False):
         return tool_error(
             f"Reactions require a live {platform_name} adapter in the running "
             "gateway (not available from cron/standalone contexts)."
+        )
+    # Hard read-only guard: never react in a chat configured observe_only.
+    _observe_check = getattr(adapter, "_is_observe_only_chat", None)
+    if callable(_observe_check) and _observe_check(chat_id):
+        return tool_error(
+            f"Chat {chat_id} is read-only (observe_only); the bot is not "
+            "allowed to react there."
         )
     fn_name = "remove_reaction" if remove else "add_reaction"
     react_fn = getattr(adapter, fn_name, None)
@@ -509,6 +524,12 @@ def _parse_target_ref(platform_name: str, target_ref: str):
         match = _EMAIL_TARGET_RE.fullmatch(target_ref)
         if match:
             return target_ref.strip(), None, True
+    if platform_name == "whatsapp":
+        # Native WhatsApp JIDs (group @g.us, user @s.whatsapp.net, @lid, etc.)
+        # are explicit targets — pass through verbatim. E.164 '+' numbers fall
+        # through to the _PHONE_PLATFORMS handler below.
+        if _WHATSAPP_JID_RE.fullmatch(target_ref):
+            return target_ref.strip(), None, True
     if platform_name in _PHONE_PLATFORMS:
         match = _E164_TARGET_RE.fullmatch(target_ref)
         if match:
@@ -686,6 +707,34 @@ async def _send_via_adapter(
     }
 
 
+def _is_observe_only_telegram_chat(pconfig, chat_id) -> bool:
+    """Return True when a Telegram chat is configured read-only (observe_only).
+
+    Mirrors ``TelegramAdapter._telegram_observe_only_chats`` for the
+    out-of-adapter send paths (the ``send_message`` tool and cron delivery,
+    including the standalone ``_send_telegram`` sender that never touches the
+    live adapter). Reads ``observe_only_chats`` from the platform's extra
+    config, falling back to the ``TELEGRAM_OBSERVE_ONLY_CHATS`` env var.
+    """
+    try:
+        cid = str(chat_id).strip()
+    except Exception:
+        return False
+    if not cid:
+        return False
+    raw = None
+    extra = getattr(pconfig, "extra", None)
+    if isinstance(extra, dict):
+        raw = extra.get("observe_only_chats")
+    if raw is None:
+        raw = os.getenv("TELEGRAM_OBSERVE_ONLY_CHATS", "")
+    if isinstance(raw, list):
+        chats = {str(p).strip() for p in raw if str(p).strip()}
+    else:
+        chats = {p.strip() for p in str(raw).split(",") if p.strip()}
+    return cid in chats
+
+
 async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False):
     """Route a message to the appropriate platform sender.
 
@@ -696,6 +745,20 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     from gateway.config import Platform
 
     media_files = media_files or []
+
+    # Hard read-only guard: never emit to a Telegram chat configured
+    # observe_only. Routes through here for BOTH the send_message tool and cron
+    # delivery, including the standalone _send_telegram path that bypasses the
+    # live adapter — so this is the out-of-adapter twin of the adapter guards.
+    if platform == Platform.TELEGRAM and _is_observe_only_telegram_chat(pconfig, chat_id):
+        logger.warning(
+            "Blocked send_message/cron delivery to read-only Telegram chat %s (observe_only)",
+            chat_id,
+        )
+        return _error(
+            f"Chat {chat_id} is read-only (observe_only): the bot reads messages "
+            f"there but is not allowed to send anything to it."
+        )
 
     # Weixin handles text/media delivery inside its native helper and does not
     # need the optional platform adapter imports below. Keep this branch early
@@ -1885,13 +1948,16 @@ async def _send_yuanbao(chat_id, message, media_files=None):
 
 
 # --- Registry ---
-from tools.registry import registry, tool_error
+from tools.registry import tool_error
 
-registry.register(
-    name="send_message",
-    toolset="messaging",
-    schema=SEND_MESSAGE_SCHEMA,
-    handler=send_message_tool,
-    check_fn=_check_send_message,
-    emoji="📨",
-)
+# NOTE: ``send_message`` is intentionally NOT registered as an agent-callable
+# model tool. The agent should not decide on its own to fire off cross-platform
+# messages or reactions. The send engine in this module (``_send_to_platform``,
+# ``_send_via_adapter``, ``_parse_target_ref``, the per-platform ``_send_*``
+# helpers) remains the shared transport used by:
+#   - cron delivery (cron/scheduler.py)
+#   - the ``hermes send`` CLI command (hermes_cli/send_cmd.py)
+#   - the gateway kanban notifier (dashboard-toggled, outside agent control)
+#   - the standalone MCP server (mcp_serve.py), which is an opt-in surface
+# Those callers import the helpers directly; none of them need the registry
+# entry.
