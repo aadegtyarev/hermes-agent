@@ -1,0 +1,10 @@
+name: discourse
+version: 1.0.0
+description: "Discourse forum integration (read-only) — search the forum and read full topics. API key optional (only needed for private forums); held parent-side, never exposed to the model or sandbox."
+author: WirenBoard
+kind: standalone
+requires_env: []
+provides_tools:
+  - discourse_search
+  - discourse_read_topic
+provides_hooks: []

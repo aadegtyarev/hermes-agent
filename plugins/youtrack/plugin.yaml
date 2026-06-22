@@ -1,0 +1,12 @@
+name: youtrack
+version: 1.0.0
+description: "YouTrack issue-tracker integration — search and read issues (read), add comments and create issues (write). Permanent token held parent-side, never exposed to the model or sandbox; scope a dedicated bot account on the YouTrack side."
+author: WirenBoard
+kind: standalone
+requires_env: []
+provides_tools:
+  - youtrack_search
+  - youtrack_read_issue
+  - youtrack_comment
+  - youtrack_create_issue
+provides_hooks: []

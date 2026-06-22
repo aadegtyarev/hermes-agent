@@ -2326,6 +2326,12 @@ class TelegramAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None
     ) -> SendResult:
         """Send a message to a Telegram chat."""
+        if self._is_observe_only_chat(chat_id):
+            logger.warning(
+                "[%s] Blocked outbound send to read-only chat %s (observe_only)",
+                getattr(self, "name", "telegram"), chat_id,
+            )
+            return SendResult(success=False, error="observe_only_chat")
         if not self._bot:
             return SendResult(success=False, error="Not connected")
 
@@ -2664,6 +2670,12 @@ class TelegramAdapter(BasePlatformAdapter):
         continuation messages, returning the final chunk's id so subsequent
         edits target the most recent visible message.
         """
+        if self._is_observe_only_chat(chat_id):
+            logger.warning(
+                "[%s] Blocked outbound edit to read-only chat %s (observe_only)",
+                getattr(self, "name", "telegram"), chat_id,
+            )
+            return SendResult(success=False, error="observe_only_chat")
         if not self._bot:
             return SendResult(success=False, error="Not connected")
 
@@ -3062,6 +3074,12 @@ class TelegramAdapter(BasePlatformAdapter):
         final ``sendMessage``/``sendRichMessage`` is what the user receives in
         their history).
         """
+        if self._is_observe_only_chat(chat_id):
+            logger.warning(
+                "[%s] Blocked outbound draft to read-only chat %s (observe_only)",
+                getattr(self, "name", "telegram"), chat_id,
+            )
+            return SendResult(success=False, error="observe_only_chat")
         if not self._bot:
             return SendResult(success=False, error="not_connected")
 
@@ -4937,6 +4955,8 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         """Send typing indicator."""
+        if self._is_observe_only_chat(chat_id):
+            return
         if self._bot:
             _is_dm_topic: bool = False
             message_thread_id: Optional[int] = None
@@ -5245,6 +5265,40 @@ class TelegramAdapter(BasePlatformAdapter):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
 
+    def _telegram_observe_only_chats(self) -> set[str]:
+        """Return chats the bot READS but must NEVER send to (hard read-only).
+
+        Messages from these chats are ingested as context (see
+        :meth:`_should_observe_unmentioned_group_message`) but never dispatch
+        the agent (:meth:`_should_process_message` returns False), and every
+        outbound path is blocked by :meth:`_is_observe_only_chat`. Independent
+        of ``allowed_chats`` / ``group_allowed_chats``: a chat listed here is
+        read regardless of those allowlists and the bot can never reply, be
+        @mentioned into replying, stream, react, or be targeted by the
+        ``send_message`` tool or cron delivery.
+        """
+        raw = self.config.extra.get("observe_only_chats")
+        if raw is None:
+            raw = os.getenv("TELEGRAM_OBSERVE_ONLY_CHATS", "")
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        return {part.strip() for part in str(raw).split(",") if part.strip()}
+
+    def _is_observe_only_chat(self, chat_id) -> bool:
+        """Return True when ``chat_id`` is a read-only chat — block ALL outbound.
+
+        Called at every Telegram Bot API send chokepoint. Fail-safe: any error
+        resolving the id returns False (do not accidentally block normal chats),
+        but a matching read-only id always blocks.
+        """
+        try:
+            cid = str(chat_id).strip()
+        except Exception:
+            return False
+        if not cid:
+            return False
+        return cid in self._telegram_observe_only_chats()
+
     def _telegram_group_allowed_chats(self) -> set[str]:
         """Return Telegram chats authorized at group scope."""
         raw = self.config.extra.get("group_allowed_chats")
@@ -5518,6 +5572,22 @@ class TelegramAdapter(BasePlatformAdapter):
 
     def _should_observe_unmentioned_group_message(self, message: Message) -> bool:
         """Return True when a group message should be stored but not dispatched."""
+        # Read-only chats ingest EVERY message as context, independent of the
+        # observe_unmentioned flag, allowed_chats, or whether the bot was
+        # addressed (the bot can never reply here, so mentions/replies are
+        # stored too). Checked first so it works standalone. Explicit thread
+        # ignores are still honored.
+        if self._is_group_chat(message):
+            chat_id_str = str(getattr(getattr(message, "chat", None), "id", ""))
+            if chat_id_str in self._telegram_observe_only_chats():
+                thread_id = getattr(message, "message_thread_id", None)
+                if thread_id is not None:
+                    try:
+                        if int(thread_id) in self._telegram_ignored_threads():
+                            return False
+                    except (TypeError, ValueError):
+                        return False
+                return True
         if not self._telegram_observe_unmentioned_group_messages():
             return False
         if not self._is_group_chat(message):
@@ -5833,6 +5903,13 @@ class TelegramAdapter(BasePlatformAdapter):
             return True
 
         chat_id_str = str(getattr(getattr(message, "chat", None), "id", ""))
+
+        # Read-only chats never dispatch the agent — no mention, reply, wake
+        # word, or guest bypass can trigger a response. They are ingested as
+        # context instead (see _should_observe_unmentioned_group_message) and
+        # the outbound guard blocks any send to them.
+        if chat_id_str in self._telegram_observe_only_chats():
+            return False
 
         if self._telegram_exclusive_bot_mentions() and self._explicit_bot_mentions_exclude_self(message):
             return False
@@ -6753,6 +6830,8 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def _set_reaction(self, chat_id: str, message_id: str, emoji: str) -> bool:
         """Set a single emoji reaction on a Telegram message."""
+        if self._is_observe_only_chat(chat_id):
+            return False
         if not self._bot:
             return False
         try:
@@ -6774,6 +6853,8 @@ class TelegramAdapter(BasePlatformAdapter):
         reactions on a message — equivalent to Bot API 10.0's
         ``deleteMessageReaction`` but supported in PTB 22.6 already.
         """
+        if self._is_observe_only_chat(chat_id):
+            return False
         if not self._bot:
             return False
         try:

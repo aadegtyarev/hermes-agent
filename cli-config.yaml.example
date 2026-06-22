@@ -722,6 +722,15 @@ platform_toolsets:
 #     # Default false; ordinary messages, replies, and regex wake words stay blocked.
 #     guest_mode: false
 #     # allowed_chats: ["-1001234567890"]
+#     # observe_only_chats: READ-ONLY chats. The bot ingests every message from
+#     # these chats as context but is HARD-BLOCKED from sending anything to them
+#     # (no reply, @mention, reply-to, wake word, send_message tool, cron
+#     # delivery, streaming, reaction, or typing indicator). Independent of
+#     # allowed_chats — a chat here is read regardless of the response allowlist
+#     # and can never be answered. Use for a public chat the team wants the bot
+#     # to watch without ever speaking in it. Remember to disable the bot's
+#     # privacy mode in @BotFather so it receives all group messages.
+#     # observe_only_chats: ["-1009876543210"]
 #     extra:
 #       disable_link_previews: false  # Set true to suppress Telegram URL previews in bot messages
 #       rich_messages: false          # Bot API 10.1 rich messages (tables/task lists/details/math); default true, set false to force legacy MarkdownV2

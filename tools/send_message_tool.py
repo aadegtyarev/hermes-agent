@@ -264,6 +264,13 @@ def _handle_react(args, remove=False):
             f"Reactions require a live {platform_name} adapter in the running "
             "gateway (not available from cron/standalone contexts)."
         )
+    # Hard read-only guard: never react in a chat configured observe_only.
+    _observe_check = getattr(adapter, "_is_observe_only_chat", None)
+    if callable(_observe_check) and _observe_check(chat_id):
+        return tool_error(
+            f"Chat {chat_id} is read-only (observe_only); the bot is not "
+            "allowed to react there."
+        )
     fn_name = "remove_reaction" if remove else "add_reaction"
     react_fn = getattr(adapter, fn_name, None)
     if not callable(react_fn):
@@ -700,6 +707,34 @@ async def _send_via_adapter(
     }
 
 
+def _is_observe_only_telegram_chat(pconfig, chat_id) -> bool:
+    """Return True when a Telegram chat is configured read-only (observe_only).
+
+    Mirrors ``TelegramAdapter._telegram_observe_only_chats`` for the
+    out-of-adapter send paths (the ``send_message`` tool and cron delivery,
+    including the standalone ``_send_telegram`` sender that never touches the
+    live adapter). Reads ``observe_only_chats`` from the platform's extra
+    config, falling back to the ``TELEGRAM_OBSERVE_ONLY_CHATS`` env var.
+    """
+    try:
+        cid = str(chat_id).strip()
+    except Exception:
+        return False
+    if not cid:
+        return False
+    raw = None
+    extra = getattr(pconfig, "extra", None)
+    if isinstance(extra, dict):
+        raw = extra.get("observe_only_chats")
+    if raw is None:
+        raw = os.getenv("TELEGRAM_OBSERVE_ONLY_CHATS", "")
+    if isinstance(raw, list):
+        chats = {str(p).strip() for p in raw if str(p).strip()}
+    else:
+        chats = {p.strip() for p in str(raw).split(",") if p.strip()}
+    return cid in chats
+
+
 async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False):
     """Route a message to the appropriate platform sender.
 
@@ -710,6 +745,20 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     from gateway.config import Platform
 
     media_files = media_files or []
+
+    # Hard read-only guard: never emit to a Telegram chat configured
+    # observe_only. Routes through here for BOTH the send_message tool and cron
+    # delivery, including the standalone _send_telegram path that bypasses the
+    # live adapter — so this is the out-of-adapter twin of the adapter guards.
+    if platform == Platform.TELEGRAM and _is_observe_only_telegram_chat(pconfig, chat_id):
+        logger.warning(
+            "Blocked send_message/cron delivery to read-only Telegram chat %s (observe_only)",
+            chat_id,
+        )
+        return _error(
+            f"Chat {chat_id} is read-only (observe_only): the bot reads messages "
+            f"there but is not allowed to send anything to it."
+        )
 
     # Weixin handles text/media delivery inside its native helper and does not
     # need the optional platform adapter imports below. Keep this branch early
