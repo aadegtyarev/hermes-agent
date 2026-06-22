@@ -18,7 +18,15 @@ except ImportError:
     MautrixClient = None
 
 from gateway.config import Platform, PlatformConfig
-def _markdown_to_html(text):    import re    t = text    t = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", t)    t = re.sub(r"\*(.+?)\*", r"<em>\1</em>", t)    t = re.sub(r"\x60(.+?)\x60", r"<code>\1</code>", t)    t = t.replace("\n", "<br/>")    return t
+def _markdown_to_html(text):
+    """Convert basic markdown to Matrix HTML."""
+    import re
+    t = text
+    t = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", t)
+    t = re.sub(r"\*(.+?)\*", r"<em>\1</em>", t)
+    t = re.sub(r"`(.+?)`", r"<code>\1</code>", t)
+    t = t.replace("\n", "<br/>")
+    return t
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
