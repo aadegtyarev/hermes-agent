@@ -167,7 +167,7 @@ class MatrixSimpleAdapter(BasePlatformAdapter):
 
                         sender = ev.get("sender", "")
                         sender_name = sender.split(":")[0].lstrip("@")
-                        if sender_name == self._username:
+                        if sender_name in ('conduit', self._username):
                             continue
                         body = ev.get("content", {}).get("body", "").strip()
                         if not body:
@@ -223,7 +223,7 @@ class MatrixSimpleAdapter(BasePlatformAdapter):
         sender = ev.get("sender", "")
         sender_name = sender.split(":")[0].lstrip("@")
 
-        if sender_name == self._username:
+        if sender_name in ('conduit', self._username):
             return
 
         logger.info(
