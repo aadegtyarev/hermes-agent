@@ -8,6 +8,8 @@ This folder is the deployment bundle (no secrets — those go in `.env`):
 
 - `Dockerfile` — terminal-backend image (`unar` + `ripgrep` on the default base)
 - `config.yaml` — the full settled config (env-specific ids/secrets are placeholders)
+- `cron-setup.sh` — scaffolds the scheduled jobs via `hermes cron create`
+- `scripts/backup.sh` — nightly profile backup (run by the backup cron job)
 
 ---
 
@@ -81,11 +83,13 @@ session_search, todo, code_execution, cronjob, discourse, youtrack`. No raw
    ```bash
    docker build -t hermes-tp:latest deploy/tp-assistant
    ```
-2. **Fill `config.yaml`:** replace the `model.default` TODO and the
-   `-100<...>` chat-id placeholders (work chats in `allowed_chats` /
-   `group_allowed_chats`, the public chat in `observe_only_chats`).
+2. **Fill `config.yaml`:** replace the `-100<...>` chat-id placeholders (work
+   chats in `allowed_chats` / `group_allowed_chats`, the public chat in
+   `observe_only_chats`). Model/provider is set: OpenRouter +
+   `anthropic/claude-sonnet-4.6` — swap the slug to trade capability for cost.
 3. **Fill `.env`** (gitignored) with secrets:
    ```
+   OPENROUTER_API_KEY=...
    TELEGRAM_BOT_TOKEN=...
    TELEGRAM_ALLOWED_USERS=<id1>,<id2>,<id3>
    DISCOURSE_URL=...            # DISCOURSE_API_KEY optional (private forums)
@@ -94,17 +98,62 @@ session_search, todo, code_execution, cronjob, discourse, youtrack`. No raw
 4. **Disable the bot's privacy mode** in @BotFather so it receives all group
    messages (required for the public observe-only chat to be readable).
 5. Start the gateway with this profile/config.
+6. **Scaffold cron jobs:** copy `scripts/backup.sh` to `~/.hermes/scripts/`
+   (`chmod +x`), edit the `DELIVER` / `MONITOR_URL` placeholders in
+   `cron-setup.sh`, then run it once. Cron jobs live in profile state (not
+   `config.yaml`), so this is a post-start step. Verify with `hermes cron list`.
+
+## Scheduled jobs (cron-setup.sh)
+
+Created via the bot's own cron tool — not declarative in config:
+
+- **Discourse digest** (daily 09:00) — new/unanswered topics → work chat.
+- **YouTrack summary** (daily 09:30) — opened-24h + stale-7d tickets.
+- **Changelog monitor** (hourly) — watches a URL, `[SILENT]` unless it changed.
+- **Profile backup** (nightly 02:00) — `--no-agent` runs `backup.sh`, keeps the
+  newest 14 archives, silent unless it fails.
 
 ---
 
 ## Open items (TODO in config.yaml)
 
-1. Model / provider for the 128k window.
-2. Final skill selection for TP (e.g. research, github/codebase-inspection,
-   productivity/ocr-and-documents, security/oss-forensics).
-3. Cron jobs (digests / monitoring / backups).
-4. Keep `session_search`? (One profile, no DMs → no cross-user leak.)
-5. Public-bot role beyond observe-only (client replies?) — currently read-only.
+1. ~~Model / provider for the 128k window.~~ DONE — OpenRouter +
+   `anthropic/claude-sonnet-4.6` (`provider_routing.data_collection: deny`).
+2. ~~Final skill selection for TP.~~ DONE — kept research, productivity,
+   data-science, software-development, github, note-taking; disabled the rest
+   via `skills.disabled` (opt-out). Open sub-item: enable optional
+   `security/oss-forensics` via `hermes claw` if archive forensics is needed.
+3. ~~Cron jobs (digests / monitoring / backups).~~ DONE — scaffolded in
+   `cron-setup.sh` (+ `scripts/backup.sh`); schedules/targets are placeholders.
+4. ~~Keep `session_search`?~~ DONE — KEPT. Shared history search is a feature
+   for a trusted team; the work→public boundary is enforced by observe-only
+   (the bot can't emit publicly), not by search scope; data is non-secret.
+5. ~~Public-bot role beyond observe-only (client replies?)~~ DECIDED — stays
+   observe-only here; client help, if added, ships as a SEPARATE public
+   profile (see "Future: public client profile" below).
+
+---
+
+## Future: public client profile (planned, not built)
+
+If the bot should ever *answer* clients in the public chat, it must run as a
+**separate Hermes profile**, never by un-blocking observe-only here. The profile
+is Hermes's hard boundary (profile-scoped `state.db`, memory, sessions, skills),
+so a second profile physically cannot read this assistant's work-chat history —
+which is exactly the work→public guarantee we need.
+
+Sketch of that second profile:
+- Its own bot token and OS/profile dir; **only** the public chat in
+  `allowed_chats` / `group_allowed_chats`; no `observe_only_chats`, no work chats.
+- Minimal toolset: drop `session_search` and the internal `discourse`/`youtrack`
+  plugins; keep `web` + public-facing skills only. No access to internal
+  archives (nothing internal mounted).
+- Shares the same hardened-docker / no-keys posture.
+- Multi-gateway note: only one gateway owns the kanban dispatcher
+  (`kanban.dispatch_in_gateway: true`); the public profile's gateway sets it
+  `false`. (See docs/kanban/multi-gateway.md.)
+
+This is a design note only — no config for it ships in this bundle yet.
 
 ---
 

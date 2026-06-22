@@ -3,9 +3,21 @@
 # Items marked TODO are still open in the design discussion.
 
 model:
-  # TODO: pick the 128k model + provider (anthropic / openrouter / nous / custom).
-  default: "anthropic/claude-..."
-  context_length: 131072        # 128k window
+  # OpenRouter: one OPENROUTER_API_KEY, any model slug, swappable without code.
+  # Primary is a strong agentic tool-use model (200k ctx, covers the 128k below);
+  # change the slug to trade capability for cost (e.g. a cheaper model for a
+  # monitoring-only profile).
+  provider: "openrouter"          # requires OPENROUTER_API_KEY in .env
+  default: "anthropic/claude-sonnet-4.6"
+  context_length: 131072          # 128k window
+
+# OpenRouter routing: don't let upstream providers retain our (internal,
+# non-secret) data, and prefer responsive providers for chat latency.
+provider_routing:
+  sort: "throughput"
+  data_collection: "deny"         # exclude providers that may store request data
+openrouter:
+  response_cache: true            # free instant replays of identical requests
 
 # Distinguish individual users within group chats.
 group_sessions_per_user: true
@@ -13,6 +25,9 @@ group_sessions_per_user: true
 # Tools the agent gets on Telegram. No raw `terminal`; `code_execution` is the
 # sandboxed Python surface used to unpack/grep archives. `file` (read/search)
 # also runs inside the docker backend.
+# session_search is KEPT deliberately: shared history search is a feature for a
+# trusted team; the work->public boundary is enforced by observe-only (the bot
+# can't emit in the public chat), not by search scope; data is non-secret.
 platform_toolsets:
   telegram: [web, file, vision, skills, memory, session_search, todo,
              code_execution, cronjob, discourse, youtrack]
@@ -58,6 +73,24 @@ compression:
   protect_last_n: 30
 skills:
   creation_nudge_interval: 15
+  # Opt-out model: every bundled skill is discoverable; we disable the
+  # categories irrelevant to a TP/integrations bot to cut prompt noise.
+  # KEPT (selected): research, productivity, data-science,
+  #   software-development, github, note-taking.
+  # NOTE: security/oss-forensics lives in optional-skills/ and needs separate
+  #   enabling (hermes claw / optional-skills) — not toggled here.
+  disabled:
+    - apple
+    - autonomous-ai-agents
+    - creative
+    - devops
+    - dogfood
+    - email
+    - media
+    - mlops
+    - smart-home
+    - social-media
+    - yuanbao
 curator:
   enabled: true
   consolidate: true
@@ -66,5 +99,9 @@ curator:
 plugins:
   enabled: [discourse, youtrack]
 
-# TODO (open): final skill selection for TP, cron jobs (digests/monitoring),
-# whether to keep session_search, public-bot role beyond observe-only.
+# Design settled. DONE: model/provider (OpenRouter + claude-sonnet-4.6, see
+#   model: above); skill selection (skills.disabled above); cron jobs
+#   (cron-setup.sh); session_search kept (see platform_toolsets note); public
+#   chat stays observe-only — client help would be a separate profile (README).
+# Remaining before deploy = fill placeholders: OPENROUTER_API_KEY + ids in .env,
+#   the -100<...> chat ids, and cron-setup.sh DELIVER / MONITOR_URL.
