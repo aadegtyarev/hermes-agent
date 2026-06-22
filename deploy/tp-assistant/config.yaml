@@ -32,6 +32,12 @@ platform_toolsets:
   telegram: [web, file, vision, skills, memory, session_search, todo,
              code_execution, cronjob, discourse, youtrack]
 
+# Web search backend for the `web` toolset. ddgs = DuckDuckGo, no API key,
+# no external account. Search runs PARENT-SIDE (gateway), so the gateway env
+# needs `pip install ddgs` — NOT the terminal Dockerfile.
+web:
+  search_backend: ddgs
+
 platforms:
   telegram:
     require_mention: true        # in groups, respond only when addressed
@@ -101,7 +107,10 @@ curator:
 
 # Plugins (keys/tokens live in .env, parent-side).
 plugins:
-  enabled: [holographic, discourse, youtrack]
+  enabled: [holographic, discourse, youtrack, disk-cleanup]
+  # disk-cleanup: auto-removes ephemeral files (unpacked archives, scratch
+  # scripts, cron logs) via hooks — keeps the container/disk tidy, no agent
+  # action needed.
   # Holographic memory provider — local SQLite DB (see memory.provider above).
   hermes-memory-store:
     db_path: ${HERMES_HOME}/memory_store.db

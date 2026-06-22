@@ -82,13 +82,24 @@ session_search, todo, code_execution, cronjob, discourse, youtrack`. No raw
 - **youtrack** (read+write): `youtrack_search`, `youtrack_read_issue`,
   `youtrack_comment`, `youtrack_create_issue`.
 
+**Web search:** `web.search_backend: ddgs` (DuckDuckGo, no API key). Web search
+runs parent-side in the gateway, so the **gateway** Python env needs
+`pip install ddgs` — it is NOT part of the terminal Dockerfile.
+
+**disk-cleanup** (`plugins.enabled`): auto-removes ephemeral files (unpacked
+archives, scratch scripts, cron logs) via session hooks — no agent action.
+
+(Surveyed but not enabled: security-guidance, observability/langfuse, n8n MCP,
+kanban — add later if needed.)
+
 ---
 
 ## Setup
 
-1. **Build the terminal image:**
+1. **Build the terminal image** and install the gateway-side search dep:
    ```bash
    docker build -t hermes-tp:latest deploy/tp-assistant
+   pip install ddgs          # in the gateway's Python env (web search is parent-side)
    ```
 2. **Fill `config.yaml`:** replace the `-100<...>` chat-id placeholders (work
    chats in `allowed_chats` / `group_allowed_chats`, the public chat in
