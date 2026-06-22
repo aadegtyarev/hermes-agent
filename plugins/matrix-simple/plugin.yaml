@@ -1,0 +1,30 @@
+name: matrix-simple
+label: Matrix (simple)
+kind: platform
+version: 1.0.0
+description: >
+  Simple Matrix client for Hermes. Text-only, no E2EE, no reactions.
+  Connects as a regular user, reads all messages in joined rooms.
+author: adsrv
+requires_env:
+  - name: MATRIX_HOMESERVER
+    description: "Matrix homeserver URL (e.g. https://matrix.adsrv.ru)"
+    prompt: "Matrix homeserver"
+    password: false
+  - name: MATRIX_USERNAME
+    description: "Matrix username (e.g. kern)"
+    prompt: "Matrix username"
+    password: false
+  - name: MATRIX_PASSWORD
+    description: "Matrix password"
+    prompt: "Matrix password"
+    password: true
+optional_env:
+  - name: MATRIX_ALLOWED_USERS
+    description: "Comma-separated Matrix user IDs to allow"
+    prompt: "Allowed users (comma-separated)"
+    password: false
+  - name: MATRIX_HOME_ROOM
+    description: "Room ID for cron/notification delivery"
+    prompt: "Home room ID"
+    password: false
