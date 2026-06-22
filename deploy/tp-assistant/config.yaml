@@ -1,0 +1,70 @@
+# Hermes config for the TP / integrations team assistant.
+# Secrets and environment-specific ids live in .env (gitignored), NOT here.
+# Items marked TODO are still open in the design discussion.
+
+model:
+  # TODO: pick the 128k model + provider (anthropic / openrouter / nous / custom).
+  default: "anthropic/claude-..."
+  context_length: 131072        # 128k window
+
+# Distinguish individual users within group chats.
+group_sessions_per_user: true
+
+# Tools the agent gets on Telegram. No raw `terminal`; `code_execution` is the
+# sandboxed Python surface used to unpack/grep archives. `file` (read/search)
+# also runs inside the docker backend.
+platform_toolsets:
+  telegram: [web, file, vision, skills, memory, session_search, todo,
+             code_execution, cronjob, discourse, youtrack]
+
+platforms:
+  telegram:
+    require_mention: true        # in groups, respond only when addressed
+    extra:
+      # Internal work chats — bot reads AND responds. (chat ids, not secret;
+      # fill at deploy time.)
+      allowed_chats: ["-100<work1>", "-100<work2>", "-100<work3>"]
+      group_allowed_chats: ["-100<work1>", "-100<work2>", "-100<work3>"]
+      # Public chat — READ-ONLY: ingested as context, bot can never send there.
+      observe_only_chats: ["-100<public>"]
+
+# Execution: hardened docker container, no approval prompts, no host secrets in.
+# Archives are NOT mounted — they arrive via chat attachments (auto-cached and
+# mounted into the container at /root/.hermes/cache/documents) or are downloaded
+# from the internet into the ephemeral /workspace, then unpacked with `unar`.
+terminal:
+  backend: docker
+  docker_image: "hermes-tp:latest"          # built from deploy/tp-assistant/Dockerfile
+  docker_forward_env: []                     # keep host secrets out of the sandbox
+  docker_mount_cwd_to_workspace: false
+
+approvals:
+  mode: off                                  # safe: everything is contained
+
+code_execution:
+  timeout: 300
+  max_tool_calls: 50
+
+# Learning: persistent memory + skills + periodic curator.
+memory:
+  memory_enabled: true
+  user_profile_enabled: true
+  memory_char_limit: 5000
+  user_char_limit: 2500
+  nudge_interval: 10
+compression:
+  enabled: true
+  threshold: 0.65
+  protect_last_n: 30
+skills:
+  creation_nudge_interval: 15
+curator:
+  enabled: true
+  consolidate: true
+
+# Plugins (keys/tokens live in .env, parent-side).
+plugins:
+  enabled: [discourse, youtrack]
+
+# TODO (open): final skill selection for TP, cron jobs (digests/monitoring),
+# whether to keep session_search, public-bot role beyond observe-only.
