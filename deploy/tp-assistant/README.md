@@ -48,6 +48,13 @@ sandbox. A dedicated bot account on each service should bound the write surface.
 **Trusted small team, non-secret data** → no per-user isolation, no PII
 redaction, shared team memory is a feature.
 
+**Memory is a real DB, not flat files.** `memory.provider: holographic` swaps
+the default `builtin` MEMORY.md/USER.md store for the `holographic` plugin: a
+local SQLite database (`$HERMES_HOME/memory_store.db`) with FTS5 full-text
+search, trust scoring, and entity resolution. Self-hosted — no external service
+or API key. `auto_extract: true` pulls facts from the conversation at session
+end. Still profile-scoped (shared across the team), which here is intended.
+
 ---
 
 ## Archives — no mounting

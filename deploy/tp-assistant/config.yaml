@@ -61,12 +61,16 @@ code_execution:
   max_tool_calls: 50
 
 # Learning: persistent memory + skills + periodic curator.
+# Memory is a real DB, not the flat MEMORY.md/USER.md files: the `holographic`
+# provider stores facts in a local SQLite DB (FTS5 full-text search, trust
+# scoring, entity resolution) under $HERMES_HOME. Self-hosted, no external
+# service or key. Still profile-scoped (shared team memory — a feature here).
 memory:
+  provider: holographic       # DB-backed (SQLite); default "builtin" = MD files
   memory_enabled: true
   user_profile_enabled: true
-  memory_char_limit: 5000
-  user_char_limit: 2500
   nudge_interval: 10
+
 compression:
   enabled: true
   threshold: 0.65
@@ -97,7 +101,13 @@ curator:
 
 # Plugins (keys/tokens live in .env, parent-side).
 plugins:
-  enabled: [discourse, youtrack]
+  enabled: [holographic, discourse, youtrack]
+  # Holographic memory provider — local SQLite DB (see memory.provider above).
+  hermes-memory-store:
+    db_path: ${HERMES_HOME}/memory_store.db
+    auto_extract: true        # extract facts from the conversation at session end
+    default_trust: 0.5
+    hrr_dim: 1024
 
 # Design settled. DONE: model/provider (OpenRouter + claude-sonnet-4.6, see
 #   model: above); skill selection (skills.disabled above); cron jobs
