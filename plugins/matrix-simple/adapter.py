@@ -1,7 +1,6 @@
 """Simple Matrix platform adapter for Hermes.
 
-Text-only, no E2EE, no reactions. Uses mautrix for Matrix protocol.
-Detects @mentions and dispatches events accordingly.
+Text-only, no E2EE. Supports @mentions and reactions (read + send).
 """
 
 import asyncio
@@ -70,7 +69,10 @@ class MatrixSimpleAdapter(BasePlatformAdapter):
             r"@?" + re.escape(self._username) + r"(?::[a-zA-Z0-9.-]+)?\b",
             re.IGNORECASE,
         )
-        logger.info(f"Matrix: require_mention={self._require_mention}, username={self._username}")
+        logger.info(
+            "Matrix: require_mention=%s, username=%s",
+            self._require_mention, self._username,
+        )
 
     def _is_mentioned(self, body: str) -> bool:
         return bool(self._mention_pattern.search(body))
@@ -84,7 +86,7 @@ class MatrixSimpleAdapter(BasePlatformAdapter):
                 "type": "m.login.password",
                 "identifier": {"type": "m.id.user", "user": self._username},
                 "password": self._password,
-                "initial_device_display_name": "Hermes Bridge"
+                "initial_device_display_name": "Hermes Bridge",
             }).encode()
             req = urllib.request.Request(login_url, data=login_data,
                 headers={"Content-Type": "application/json"})
@@ -93,7 +95,7 @@ class MatrixSimpleAdapter(BasePlatformAdapter):
 
             self._token = resp["access_token"]
             user_id = resp.get("user_id", f"@{self._username}:unknown")
-            logger.info(f"Matrix: logged in as {user_id}")
+            logger.info("Matrix: logged in as %s", user_id)
 
             api = HTTPAPI(base_url=self._homeserver, token=self._token)
             self._client = MautrixClient(api=api)
@@ -106,9 +108,9 @@ class MatrixSimpleAdapter(BasePlatformAdapter):
                     method="POST")
                 try:
                     with urllib.request.urlopen(join_req, timeout=10):
-                        logger.info(f"Matrix: joined room {self._home_room}")
+                        logger.info("Matrix: joined room %s", self._home_room)
                 except Exception as e:
-                    logger.warning(f"Matrix: room join skipped: {e}")
+                    logger.warning("Matrix: room join skipped: %s", e)
 
             self._closing = False
             self._sync_task = asyncio.create_task(self._sync_loop())
@@ -117,7 +119,7 @@ class MatrixSimpleAdapter(BasePlatformAdapter):
             return True
 
         except Exception as e:
-            logger.error(f"Matrix: connect failed: {e}")
+            logger.error("Matrix: connect failed: %s", e)
             return False
 
     async def _sync_loop(self):
@@ -153,8 +155,16 @@ class MatrixSimpleAdapter(BasePlatformAdapter):
                         if len(self._seen_events) > 5000:
                             self._seen_events = set(list(self._seen_events)[-2000:])
 
-                        if ev.get("type") != "m.room.message":
+                        etype = ev.get("type", "")
+
+                        # --- Reactions ---
+                        if etype == "m.reaction":
+                            await self._handle_reaction(ev, rid)
                             continue
+
+                        if etype != "m.room.message":
+                            continue
+
                         sender = ev.get("sender", "")
                         sender_name = sender.split(":")[0].lstrip("@")
                         if sender_name == self._username:
@@ -172,11 +182,16 @@ class MatrixSimpleAdapter(BasePlatformAdapter):
                         mentioned = self._is_mentioned(body)
 
                         if self._require_mention and not mentioned:
-                            logger.debug(f"Matrix: skipping unmentioned from {sender_name}: {body[:80]}")
+                            logger.debug(
+                                "Matrix: skipping unmentioned from %s: %s",
+                                sender_name, body[:80],
+                            )
                             continue
 
                         tag = "DM" if mentioned else "ambient"
-                        logger.info(f"Matrix [{tag}] {sender_name}: {body[:100]}")
+                        logger.info(
+                            "Matrix [%s] %s: %s", tag, sender_name, body[:100],
+                        )
 
                         from gateway.session import SessionSource
                         source = SessionSource(
@@ -195,8 +210,48 @@ class MatrixSimpleAdapter(BasePlatformAdapter):
                         await self.handle_message(event)
 
             except Exception as e:
-                logger.error(f"Matrix sync error: {e}")
+                logger.error("Matrix sync error: %s", e)
                 await asyncio.sleep(5)
+
+    async def _handle_reaction(self, ev: dict, room_id: str):
+        """Process an incoming reaction event."""
+        relates_to = ev.get("content", {}).get("m.relates_to", {})
+        if relates_to.get("rel_type") != "m.annotation":
+            return
+        reacted_event_id = relates_to.get("event_id", "")
+        emoji = relates_to.get("key", "")
+        sender = ev.get("sender", "")
+        sender_name = sender.split(":")[0].lstrip("@")
+
+        if sender_name == self._username:
+            return
+
+        logger.info(
+            "Matrix [reaction] %s reacted %s to %s",
+            sender_name, emoji, reacted_event_id[:20],
+        )
+
+        # Dispatch as a reaction event so the gateway can act on it
+        from gateway.session import SessionSource
+        source = SessionSource(
+            platform=self.platform,
+            chat_id=room_id,
+            user_id=sender,
+            user_name=sender_name,
+        )
+        event = MessageEvent(
+            text=f"/reaction {emoji} -> {reacted_event_id}",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id=ev.get("event_id", ""),
+            raw_message={
+                **ev,
+                "_reaction_emoji": emoji,
+                "_reaction_target": reacted_event_id,
+                "_reaction_sender": sender_name,
+            },
+        )
+        await self.handle_message(event)
 
     def _do_sync(self, req):
         import urllib.request, json
@@ -213,25 +268,77 @@ class MatrixSimpleAdapter(BasePlatformAdapter):
         self._token = None
         logger.info("Matrix: disconnected")
 
-    async def send(self, chat_id: str, content: str, reply_to=None, metadata=None) -> SendResult:
+    async def send(
+        self, chat_id: str, content: str, reply_to=None, metadata=None,
+    ) -> SendResult:
         if not self._token:
             return SendResult(success=False, error="Not connected")
 
         try:
             import urllib.request, json, uuid
+
+            # Check if this is a reaction request
+            if metadata and metadata.get("reaction"):
+                emoji = str(metadata["reaction"])
+                target = str(metadata.get("reaction_target", ""))
+                return await self._send_reaction(chat_id, target, emoji)
+
             txn = str(uuid.uuid4())
-            send_url = f"{self._homeserver}/_matrix/client/v3/rooms/{chat_id}/send/m.room.message/{txn}"
-            payload = json.dumps({"msgtype": "m.text", "body": content}).encode()
+            send_url = (
+                f"{self._homeserver}/_matrix/client/v3/rooms/{chat_id}"
+                f"/send/m.room.message/{txn}"
+            )
+            payload = json.dumps({
+                "msgtype": "m.text",
+                "body": content,
+            }).encode()
             send_req = urllib.request.Request(send_url, data=payload,
-                headers={"Content-Type": "application/json",
-                         "Authorization": f"Bearer {self._token}"},
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self._token}",
+                },
                 method="PUT")
             with urllib.request.urlopen(send_req, timeout=15) as r:
                 resp = json.loads(r.read().decode())
             return SendResult(
                 success=True,
                 message_id=resp.get("event_id", ""),
-                chat_id=chat_id,
+            )
+        except Exception as e:
+            return SendResult(success=False, error=str(e))
+
+    async def _send_reaction(
+        self, room_id: str, target_event_id: str, emoji: str,
+    ) -> SendResult:
+        """Send a reaction (emoji) to a specific event."""
+        try:
+            import urllib.request, json, uuid
+            txn = str(uuid.uuid4())
+            react_url = (
+                f"{self._homeserver}/_matrix/client/v3/rooms/{room_id}"
+                f"/send/m.reaction/{txn}"
+            )
+            payload = json.dumps({
+                "m.relates_to": {
+                    "rel_type": "m.annotation",
+                    "event_id": target_event_id,
+                    "key": emoji,
+                },
+            }).encode()
+            react_req = urllib.request.Request(react_url, data=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self._token}",
+                },
+                method="PUT")
+            with urllib.request.urlopen(react_req, timeout=15) as r:
+                resp = json.loads(r.read().decode())
+            logger.info(
+                "Matrix: reacted %s to %s", emoji, target_event_id[:20],
+            )
+            return SendResult(
+                success=True,
+                message_id=resp.get("event_id", ""),
             )
         except Exception as e:
             return SendResult(success=False, error=str(e))
