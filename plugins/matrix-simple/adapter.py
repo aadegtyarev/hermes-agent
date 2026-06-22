@@ -1,11 +1,13 @@
 """Simple Matrix platform adapter for Hermes.
 
 Text-only, no E2EE, no reactions. Uses mautrix for Matrix protocol.
+Detects @mentions and dispatches events accordingly.
 """
 
 import asyncio
 import logging
 import os
+import re
 from typing import Any, Dict, Optional
 
 try:
@@ -55,6 +57,7 @@ class MatrixSimpleAdapter(BasePlatformAdapter):
         self._username = os.getenv("MATRIX_USERNAME", "").strip()
         self._password = os.getenv("MATRIX_PASSWORD", "").strip()
         self._home_room = os.getenv("MATRIX_HOME_ROOM", "").strip()
+        self._require_mention = os.getenv("MATRIX_REQUIRE_MENTION", "false").strip().lower() in ("true", "1", "yes")
 
         self._client: Optional[Any] = None
         self._token: Optional[str] = None
@@ -63,9 +66,17 @@ class MatrixSimpleAdapter(BasePlatformAdapter):
         self._seen_events: set = set()
         self._last_event_ts: float = 0.0
 
+        self._mention_pattern = re.compile(
+            r"@?" + re.escape(self._username) + r"(?::[a-zA-Z0-9.-]+)?\b",
+            re.IGNORECASE,
+        )
+        logger.info(f"Matrix: require_mention={self._require_mention}, username={self._username}")
+
+    def _is_mentioned(self, body: str) -> bool:
+        return bool(self._mention_pattern.search(body))
+
     async def connect(self) -> bool:
         try:
-            # Login
             import urllib.request, json, uuid
 
             login_url = f"{self._homeserver}/_matrix/client/v3/login"
@@ -84,11 +95,9 @@ class MatrixSimpleAdapter(BasePlatformAdapter):
             user_id = resp.get("user_id", f"@{self._username}:unknown")
             logger.info(f"Matrix: logged in as {user_id}")
 
-            # Use mautrix for sync
             api = HTTPAPI(base_url=self._homeserver, token=self._token)
             self._client = MautrixClient(api=api)
 
-            # Join home room if set
             if self._home_room:
                 join_url = f"{self._homeserver}/_matrix/client/v3/rooms/{self._home_room}/join"
                 join_req = urllib.request.Request(join_url, data=b"{}",
@@ -160,7 +169,15 @@ class MatrixSimpleAdapter(BasePlatformAdapter):
                             continue
                         self._last_event_ts = ts
 
-                        logger.info(f"Matrix: {sender_name}: {body[:100]}")
+                        mentioned = self._is_mentioned(body)
+
+                        if self._require_mention and not mentioned:
+                            logger.debug(f"Matrix: skipping unmentioned from {sender_name}: {body[:80]}")
+                            continue
+
+                        tag = "DM" if mentioned else "ambient"
+                        logger.info(f"Matrix [{tag}] {sender_name}: {body[:100]}")
+
                         from gateway.session import SessionSource
                         source = SessionSource(
                             platform_name="matrix-simple",
@@ -204,8 +221,8 @@ class MatrixSimpleAdapter(BasePlatformAdapter):
             import urllib.request, json, uuid
             txn = str(uuid.uuid4())
             send_url = f"{self._homeserver}/_matrix/client/v3/rooms/{chat_id}/send/m.room.message/{txn}"
-            body = json.dumps({"msgtype": "m.text", "body": text}).encode()
-            send_req = urllib.request.Request(send_url, data=body,
+            payload = json.dumps({"msgtype": "m.text", "body": content}).encode()
+            send_req = urllib.request.Request(send_url, data=payload,
                 headers={"Content-Type": "application/json",
                          "Authorization": f"Bearer {self._token}"},
                 method="PUT")
@@ -219,9 +236,9 @@ class MatrixSimpleAdapter(BasePlatformAdapter):
         except Exception as e:
             return SendResult(success=False, error=str(e))
 
-
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {"name": chat_id, "type": "group"}
+
 
 def register(ctx) -> None:
     ctx.register_platform(
