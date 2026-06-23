@@ -1561,41 +1561,7 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             thread_id=os.getenv("MATTERMOST_HOME_CHANNEL_THREAD_ID") or None,
         )
 
-    # Matrix
-    matrix_token = os.getenv("MATRIX_ACCESS_TOKEN")
-    matrix_homeserver = os.getenv("MATRIX_HOMESERVER", "")
-    if matrix_token or os.getenv("MATRIX_PASSWORD"):
-        if not matrix_homeserver:
-            logger.warning("MATRIX_ACCESS_TOKEN/MATRIX_PASSWORD set but MATRIX_HOMESERVER is missing")
-        matrix_config = _enable_from_env(Platform.MATRIX)
-        if matrix_token:
-            matrix_config.token = matrix_token
-        matrix_config.extra["homeserver"] = matrix_homeserver
-        matrix_user = os.getenv("MATRIX_USER_ID", "")
-        if matrix_user:
-            matrix_config.extra["user_id"] = matrix_user
-        matrix_password = os.getenv("MATRIX_PASSWORD", "")
-        if matrix_password:
-            matrix_config.extra["password"] = matrix_password
-        matrix_e2ee_mode = os.getenv("MATRIX_E2EE_MODE", "").strip().lower()
-        matrix_e2ee = (
-            matrix_e2ee_mode in ("required", "require", "optional", "prefer", "preferred")
-            or os.getenv("MATRIX_ENCRYPTION", "").lower() in ("true", "1", "yes")
-        )
-        matrix_config.extra["encryption"] = matrix_e2ee
-        if matrix_e2ee_mode:
-            matrix_config.extra["e2ee_mode"] = matrix_e2ee_mode
-        matrix_device_id = os.getenv("MATRIX_DEVICE_ID", "")
-        if matrix_device_id:
-            matrix_config.extra["device_id"] = matrix_device_id
-    matrix_home = os.getenv("MATRIX_HOME_ROOM")
-    if matrix_home and Platform.MATRIX in config.platforms:
-        config.platforms[Platform.MATRIX].home_channel = HomeChannel(
-            platform=Platform.MATRIX,
-            chat_id=matrix_home,
-            name=os.getenv("MATRIX_HOME_ROOM_NAME", "Home"),
-            thread_id=os.getenv("MATRIX_HOME_ROOM_THREAD_ID") or None,
-        )
+    # Matrix (full) — removed from fork; matrix-simple handles Matrix messaging
 
     # Home Assistant
     hass_token = os.getenv("HASS_TOKEN")
