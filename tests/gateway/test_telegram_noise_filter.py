@@ -81,3 +81,25 @@ def test_telegram_final_response_keeps_normal_answers():
     answer = "Here is the clean summary you asked for."
 
     assert _sanitize_gateway_final_response(Platform.TELEGRAM, answer) == answer
+
+
+def test_matrix_simple_suppresses_all_status_chatter():
+    """matrix-simple is a clean surface: no status/progress chatter at all."""
+    service_messages = [
+        "💾 Self-improvement review: Memory updated",
+        "📦 Preflight compression: ~64,356 tokens >= 64,000 threshold. This may take a moment.",
+        "🗜️ Compacting context — summarizing earlier conversation so I can continue...",
+        "⏳ Retrying in 4.2s (attempt 1/3)...",
+        "✨ Switched to a faster model for this turn.",
+        "ℹ Some perfectly ordinary status note.",
+    ]
+
+    for message in service_messages:
+        assert _prepare_gateway_status_message("matrix-simple", "lifecycle", message) is None
+
+
+def test_matrix_simple_final_response_is_untouched():
+    """The agent's actual reply must still reach the Matrix room verbatim."""
+    answer = "Поставка оформлена, отгрузка завтра в 10:00."
+
+    assert _sanitize_gateway_final_response("matrix-simple", answer) == answer

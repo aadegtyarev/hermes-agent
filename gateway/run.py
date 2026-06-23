@@ -87,6 +87,13 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+# Platforms that should stay a clean conversational surface: the user sees
+# only the agent's actual replies, never interim status/progress/lifecycle
+# chatter (preflight compression, context compaction, self-improvement review,
+# retry backoff, etc.). matrix-simple is a lightweight chat bridge with no
+# status bar, so this noise just clutters the room.
+_SERVICE_SILENT_PLATFORMS = frozenset({"matrix-simple"})
+
 _GATEWAY_PROVIDER_ERROR_RE = re.compile(
     r"("  # infrastructure/provider error preambles, not ordinary assistant prose
     r"api\s+(?:call\s+)?failed"
@@ -363,7 +370,12 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
     text = str(message or "").strip()
     if not text:
         return None
-    if _gateway_platform_value(platform) != "telegram":
+    platform_value = _gateway_platform_value(platform)
+    # Clean conversational surfaces (e.g. matrix-simple) get no status chatter
+    # at all — only the agent's deliberate replies reach the room.
+    if platform_value in _SERVICE_SILENT_PLATFORMS:
+        return None
+    if platform_value != "telegram":
         return text
 
     text = _redact_gateway_user_facing_secrets(text)
@@ -14894,6 +14906,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             def _deliver_bg_review_message(message: str) -> None:
                 if not _status_adapter or not _run_still_current():
+                    return
+                # Clean conversational surfaces never get self-improvement /
+                # memory-update chatter — only the agent's actual replies.
+                if _gateway_platform_value(source.platform) in _SERVICE_SILENT_PLATFORMS:
                     return
                 safe_schedule_threadsafe(
                     _status_adapter.send(
