@@ -4042,6 +4042,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.debug("Busy ack suppressed for session %s", session_key)
             return True  # input still processed, just no ack sent
 
+        # Clean conversational surfaces (e.g. matrix-simple) get no busy-ack
+        # chatter — the "⚡ Interrupting…/⏳ Queued…" lines bypass the
+        # status_callback filter, so suppress them here too. The interrupt/queue
+        # logic above has already run; we just skip the user-visible ack.
+        if _gateway_platform_value(event.source.platform) in _SERVICE_SILENT_PLATFORMS:
+            logger.debug(
+                "Busy ack suppressed for service-silent platform (session %s)",
+                session_key,
+            )
+            return True  # input still processed, just no ack sent
+
         # Debounce: only send an acknowledgment once every 30 seconds per session
         # to avoid spamming the user when they send multiple messages quickly
         _BUSY_ACK_COOLDOWN = 30
