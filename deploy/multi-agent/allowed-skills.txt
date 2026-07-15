@@ -1,0 +1,32 @@
+# BASE KIT — skills menu for the deploy. One path per line; #-comments ignored.
+# render.py resolves each path against the repo `skills/` first, then
+# `optional-skills/`. Custom skills (vendored under base/skills/) are listed at
+# the bottom for reference — grant them per-agent via `custom_skills:`.
+#
+# This is the MENU (what MAY be granted). Nothing is auto-assigned; grant per
+# agent in agents.yaml (`skills:` for these paths, `custom_skills:` for ours).
+
+# --- Research & knowledge (bundled) ---
+research/arxiv                       # search arXiv papers
+research/blogwatcher                 # monitor blogs / RSS-Atom feeds
+research/llm-wiki                    # build/query linked markdown KB
+note-taking/obsidian                 # read/search/edit Obsidian notes
+data-science/jupyter-live-kernel     # iterative Python via live Jupyter kernel
+
+# --- Web research (optional-skills; free, no API key) ---
+research/searxng-search              # meta-search over 70+ engines
+research/duckduckgo-search           # DuckDuckGo text/news/images
+research/scrapling                   # fetch/scrape pages, Cloudflare bypass
+research/parallel-cli                # deep research: search+extract+enrich
+
+# --- Support / diagnostics / debugging (bundled) ---
+software-development/systematic-debugging   # 4-phase root-cause debugging
+software-development/spike                  # throwaway experiments to validate an idea
+github/codebase-inspection                  # inspect codebases (LOC, languages)
+github/github-issues                        # triage/view GitHub issues
+
+# --- Custom (vendored in base/skills/ — grant via custom_skills:) ---
+# diagnostic-cross-weaving          # methodical 3-line fact-gathering (needs de-personalization — see note)
+# wb-code-research                  # verify WB software behavior via GitHub source (stable vs testing)
+# wb-support-portal-audit           # audit WB tech-support response quality on Discourse
+# (WB skills from wirenboard/wb-ai-skills are added here after rework — see README)

@@ -64,6 +64,14 @@ data/
 hermes-config/
 runtime/
 
+# Multi-agent per-instance runtime state and secrets (bind-mounted into each
+# agent container; under rootless Docker these dirs are owned by a mapped
+# sub-UID and are unreadable by the build, so the base build fails with
+# "permission denied" if they leak into the context). Never needed in the image.
+**/instances/*/data/
+**/instances/*/secrets/
+**/render/
+
 # ---------- Not needed inside the Docker image ----------
 
 # Desktop app source (Tauri/Electron); never installed in the container.

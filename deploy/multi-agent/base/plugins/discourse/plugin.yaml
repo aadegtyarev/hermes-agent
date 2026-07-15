@@ -1,0 +1,28 @@
+name: discourse
+label: Discourse (support portal)
+kind: standalone
+version: 1.0.0
+description: >
+  Read-only Discourse integration — flexible search, full thread reading,
+  and attachment/image extraction from a Discourse forum (default:
+  support.wirenboard.com). Auth is optional: works anonymously against
+  public content, or with a scoped Api-Key/Api-Username pair for restricted
+  categories. No write capability by design — there is no reply/post/like
+  tool in this plugin.
+author: adsrv
+platforms:
+  - linux
+provides_tools:
+  - discourse_search
+  - discourse_get_topic
+  - discourse_list_latest
+  - discourse_list_categories
+  - discourse_get_attachments
+optional_env:
+  - name: DISCOURSE_URL
+    description: "Base URL of the Discourse instance. Default: https://support.wirenboard.com"
+  - name: DISCOURSE_API_KEY
+    description: "Discourse API key, scoped 'Read Only', tied to a dedicated low-trust service user (see README.md). Without it, calls are anonymous/public-only."
+    secret: true
+  - name: DISCOURSE_API_USERNAME
+    description: "Username the API key is scoped to (Discourse requires this pair)."

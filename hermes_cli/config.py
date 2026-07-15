@@ -3034,6 +3034,11 @@ DEFAULT_CONFIG = {
         # reads connected accounts silently). "off" -> plain intro only.
         # The offer fires at most once (latched under onboarding.seen).
         "profile_build": "ask",
+        # Per-chat nudge ("No home channel is set for <platform>...") shown
+        # the first time a new chat messages in on a platform with no
+        # configured home channel. Set false to suppress it without setting
+        # a home channel via /sethome.
+        "home_channel_notice": True,
     },
 
     # ``hermes update`` behaviour.
@@ -3697,6 +3702,139 @@ OPTIONAL_ENV_VARS = {
         "password": False,
         "category": "provider",
         "advanced": True,
+    },
+
+    # ── WB custom plugin secrets ──
+    # Registered here so _build_provider_env_blocklist() picks them up and the
+    # subprocess-env sanitizer strips them from terminal/execute_code shells.
+    # The plugins read these from the parent process env, so stripping them from
+    # spawned subprocesses does not affect the tools. Without this, a `terminal`
+    # command like `env` leaks these into the tool output (and container logs).
+    "YOUTRACK_URL": {
+        "description": "YouTrack instance base URL (e.g. https://<company>.youtrack.cloud)",
+        "prompt": "YouTrack URL",
+        "url": None,
+        "password": False,
+        "category": "tool",
+    },
+    "YOUTRACK_TOKEN": {
+        "description": "YouTrack permanent token (yt_* tools)",
+        "prompt": "YouTrack token",
+        "url": None,
+        "password": True,
+        "category": "tool",
+    },
+    "YOUTRACK_LOGIN": {
+        "description": "Operator YouTrack login for assignee='me' resolution",
+        "prompt": "YouTrack login",
+        "url": None,
+        "password": False,
+        "category": "tool",
+    },
+    "JENKINS_URL": {
+        "description": "Jenkins base URL (jenkins_* tools)",
+        "prompt": "Jenkins URL",
+        "url": None,
+        "password": False,
+        "category": "tool",
+    },
+    "JENKINS_USER": {
+        "description": "Jenkins user (email) for matrix-auth",
+        "prompt": "Jenkins user",
+        "url": None,
+        "password": False,
+        "category": "tool",
+    },
+    "JENKINS_TOKEN": {
+        "description": "Jenkins API token (jenkins_* tools)",
+        "prompt": "Jenkins token",
+        "url": None,
+        "password": True,
+        "category": "tool",
+    },
+    "DISCOURSE_URL": {
+        "description": "Discourse base URL (discourse tools)",
+        "prompt": "Discourse URL",
+        "url": None,
+        "password": False,
+        "category": "tool",
+    },
+    "DISCOURSE_API_KEY": {
+        "description": "Discourse API key (read-only scope)",
+        "prompt": "Discourse API key",
+        "url": None,
+        "password": True,
+        "category": "tool",
+    },
+    "DISCOURSE_API_USERNAME": {
+        "description": "Discourse forum username the API key is scoped to",
+        "prompt": "Discourse API username",
+        "url": None,
+        "password": False,
+        "category": "tool",
+    },
+    "BW_CLIENTID": {
+        "description": "Bitwarden API client id (vault_* tools)",
+        "prompt": "Bitwarden client id",
+        "url": None,
+        "password": True,
+        "category": "tool",
+    },
+    "BW_CLIENTSECRET": {
+        "description": "Bitwarden API client secret (vault_* tools)",
+        "prompt": "Bitwarden client secret",
+        "url": None,
+        "password": True,
+        "category": "tool",
+    },
+    "BW_PASSWORD": {
+        "description": "Bitwarden master password (vault unlock)",
+        "prompt": "Bitwarden master password",
+        "url": None,
+        "password": True,
+        "category": "tool",
+    },
+    "BW_SERVER": {
+        "description": "Bitwarden/Vaultwarden server URL (optional, self-hosted)",
+        "prompt": "Bitwarden server URL",
+        "url": None,
+        "password": False,
+        "category": "tool",
+    },
+    "GOOGLE_OAUTH_TOKEN": {
+        "description": "Path to the Google OAuth token JSON (gdocs/gsheet tools)",
+        "prompt": "Google OAuth token path",
+        "url": None,
+        "password": True,
+        "category": "tool",
+    },
+    "SSH_KEY": {
+        "description": "SSH private key path or inline key (ssh_run)",
+        "prompt": "SSH key",
+        "url": None,
+        "password": True,
+        "category": "tool",
+    },
+    "SSH_PASSWORD": {
+        "description": "SSH login password (ssh_run, optional)",
+        "prompt": "SSH password",
+        "url": None,
+        "password": True,
+        "category": "tool",
+    },
+    "SSH_USER": {
+        "description": "Default SSH user (ssh_run, optional)",
+        "prompt": "SSH user",
+        "url": None,
+        "password": False,
+        "category": "tool",
+    },
+    "SSH_ALLOWED_HOSTS": {
+        "description": "Comma-list of hosts ssh_run may reach (empty = any)",
+        "prompt": "SSH allowed hosts",
+        "url": None,
+        "password": False,
+        "category": "tool",
     },
 
     # ── Tool API keys ──

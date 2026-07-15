@@ -1,0 +1,19 @@
+#!/command/with-contenv sh
+# shellcheck shell=sh
+# Avahi mDNS/DNS-SD daemon — resolve/browse the LAN (WB controllers etc.).
+# Publishing is DISABLED via /etc/avahi/avahi-daemon.conf, so this coexists
+# with a host avahi on 5353 (no host-name conflict). libnss-mdns then makes
+# `.local` names resolve transparently (getent/ssh/curl). Needs network_mode:
+# host so link-local multicast (224.0.0.251:5353) reaches the LAN.
+#
+# Runs as root; depends on dbus (see dependencies.d/dbus). Wait for the dbus
+# socket so avahi doesn't race it and die "Failed to create client".
+i=0
+while [ ! -S /run/dbus/system_bus_socket ] && [ "$i" -lt 100 ]; do
+    sleep 0.1
+    i=$((i + 1))
+done
+
+# --no-chroot: avahi's chroot helper doesn't fit a container; the container is
+# already the jail. avahi still drops to the unprivileged `avahi` user.
+exec avahi-daemon --no-chroot

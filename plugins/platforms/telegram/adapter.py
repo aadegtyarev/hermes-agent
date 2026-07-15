@@ -633,6 +633,21 @@ class TelegramAdapter(BasePlatformAdapter):
             if self.config.extra.get("base_url")
             else 20 * 1024 * 1024
         )
+        # Outbound (sendDocument/sendVideo/…) size cap. The public Bot API
+        # rejects uploads over 50MB; a locally-hosted telegram-bot-api server
+        # (extra.base_url) raises that to 2GB. Overridable via
+        # ``HERMES_TELEGRAM_MAX_SEND_BYTES`` so operators can tune it. The
+        # gateway media-delivery flow reads ``max_send_document_bytes`` to
+        # refuse an oversized file up front with an actionable reason (pack it
+        # into an archive / share a link) instead of a raw Telegram API error.
+        _default_send_cap = (
+            2 * 1024 * 1024 * 1024
+            if self.config.extra.get("base_url")
+            else 50 * 1024 * 1024
+        )
+        self._max_send_bytes: int = env_int(
+            "HERMES_TELEGRAM_MAX_SEND_BYTES", _default_send_cap
+        )
         # Interactive model picker state per chat
         self._model_picker_state: Dict[str, dict] = {}
         # Approval button state: message_id → session_key
@@ -3185,6 +3200,15 @@ class TelegramAdapter(BasePlatformAdapter):
             self._app.add_handler(TelegramMessageHandler(
                 filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.Document.ALL | filters.Sticker.ALL,
                 self._handle_media_message
+            ))
+            # Legacy service-message field (message.left_chat_member) — delivered to
+            # every bot in the group regardless of admin status or privacy mode,
+            # unlike ChatMemberHandler which needs the bot to be a group admin.
+            # Lets plugins revoke chat-scoped grants (e.g. telegram-context's
+            # auto-pairing) when a member leaves/is removed.
+            self._app.add_handler(TelegramMessageHandler(
+                filters.StatusUpdate.LEFT_CHAT_MEMBER,
+                self._handle_left_chat_member
             ))
             # Handle inline keyboard button callbacks (update prompts)
             self._app.add_handler(CallbackQueryHandler(self._handle_callback_query))
@@ -5788,6 +5812,11 @@ class TelegramAdapter(BasePlatformAdapter):
             f"{limit_mb} MB limit. Ask the user to send a smaller file.]"
         )
 
+    @property
+    def max_send_document_bytes(self) -> int:
+        """Max outbound attachment size in bytes (read by gateway delivery)."""
+        return int(getattr(self, "_max_send_bytes", 50 * 1024 * 1024) or 50 * 1024 * 1024)
+
     def _telegram_media_size_allowed(self, source: Any, label: str) -> tuple[bool, Optional[str]]:
         """Validate Telegram media size before downloading into memory."""
         max_bytes = int(getattr(self, "_max_doc_bytes", 20 * 1024 * 1024) or 20 * 1024 * 1024)
@@ -8014,6 +8043,33 @@ class TelegramAdapter(BasePlatformAdapter):
             return
 
         await self.handle_message(event)
+
+    async def _handle_left_chat_member(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Fire a plugin hook when a member leaves/is removed from a group.
+
+        Uses the legacy ``message.left_chat_member`` service-message field
+        (not ``ChatMemberHandler``) so it fires for every bot regardless of
+        admin status or privacy mode. Purely a notification — this adapter
+        does not itself revoke anything; plugins (e.g. telegram-context) that
+        grant chat-scoped access are expected to subscribe to the hook and
+        clean up their own state.
+        """
+        msg = update.effective_message
+        user = getattr(msg, "left_chat_member", None) if msg else None
+        chat = update.effective_chat
+        if user is None or chat is None:
+            return
+        try:
+            from hermes_cli.plugins import invoke_hook
+            invoke_hook(
+                "telegram_chat_member_left",
+                chat_id=str(chat.id),
+                chat_title=getattr(chat, "title", "") or "",
+                user_id=str(user.id),
+                user_name=getattr(user, "username", "") or getattr(user, "full_name", "") or "",
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[Telegram] telegram_chat_member_left hook invocation failed: %s", e)
 
     async def _queue_media_group_event(self, media_group_id: str, event: MessageEvent) -> None:
         """Buffer Telegram media-group items so albums arrive as one logical event.

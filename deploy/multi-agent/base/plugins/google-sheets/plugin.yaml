@@ -1,0 +1,10 @@
+name: google-sheets
+version: 1.0.0
+description: "Google Sheets integration — list tabs and read cell ranges by URL/id (READ-ONLY, spreadsheets.readonly scope). No write tools. Credentials mounted read-only, resolved parent-side."
+author: multi-agent
+kind: standalone
+requires_env: []
+provides_tools:
+  - gsheet_list_sheets
+  - gsheet_read
+provides_hooks: []

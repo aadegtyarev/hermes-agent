@@ -1,0 +1,116 @@
+# Multi-agent manifest — THE control file. Add/adjust agents here, then:
+#   python render.py && docker compose -f docker-compose.generated.yml up -d
+#
+# Per agent:
+#   name            (required) — instance id; container = hermes-<name>, data = instances/<name>/
+#   soul            — path (rel to this dir) to the persona SOUL.md
+#   toolsets        — Telegram toolset allowlist (no_mcp is appended automatically)
+#   plugins         — custom plugins to grant (dir names under base/plugins/)
+#   bundled_plugins — upstream bundled plugins to grant (paths under repo plugins/)
+#   skills          — upstream bundled skills to grant (paths under repo skills/)
+#   custom_skills   — our skills to grant (dir names under base/skills/)
+#   model           — optional model override (provider/default/context_length)
+#   dashboard: {port: N} — optional per-agent dashboard on host port N
+#
+# A plugin is reachable only if it is BOTH granted here AND its toolset is in
+# `toolsets`. Toolsets by plugin: image-gen->image_gen, github->github,
+# youtrack->youtrack, google-docs->google_docs, google-sheets->google_sheets,
+# discourse->discourse, curl-jina->web (set web.extract_backend: curl-jina in `config`).
+
+defaults:
+  # vision = core tool `vision_analyze` (image analysis); base for every agent.
+  # Needs a vision-capable model in auxiliary.vision (config) to actually run.
+  toolsets: [vision, session_search, todo, memory]
+  model:
+    provider: deepseek          # нативный провайдер; ключ ← DEEPSEEK_API_KEY (в instances/<agent>/.env). base_url резолвится сам.
+    api_key: ${DEEPSEEK_API_KEY}
+    default: deepseek-v4-flash  # болталка: текстовая V4 Flash (мёрджится ПОВЕРХ config.base.yaml)
+
+agents:
+  # Gpio — инженерный ассистент Wiren Board (собеседники — инженеры компании).
+  # Персона: personas/gpio.md + общий базис base/persona.base.md (склеивает render).
+  # Упор на веб-поиск: документация wiki.wirenboard.com через web; портал ТП
+  # support.wirenboard.com — через плагин discourse (read-only: поиск/чтение
+  # тредов/вложения, без ответа — см. base/plugins/discourse/README.md).
+  - name: gpio
+    soul: personas/gpio.md
+    mcp: true          # разрешить MCP-серверы (не добавлять no_mcp). Серверы задаются в config.mcp_servers.
+    # Память — holographic: локальный SQLite fact_store в $HERMES_HOME/memory_store.db
+    # (у каждого агента своя БД в своём volume). Ни env, ни сайдкара, ни LLM-ключа —
+    # numpy+sqlite (уже в образе). Провайдер задаётся в config.memory ниже.
+    toolsets:
+      # base capabilities
+      - web            # web_search + web_extract (wiki / support portal)
+      - browser        # браузер-автоматизация (локальный Playwright/Chromium из базового образа)
+      - vision         # vision_analyze (image analysis)
+      - skills         # skill_view / skills_list — доступ к комплекту скиллов
+      - clarify        # уточняющие вопросы
+      - file           # read/write/patch/search файлов в рабочей папке
+      - code_execution # песочный Python (data-science, скрейпинг)
+      - ssh            # bounded SSH (run/read/list/sessions/keys)
+      - terminal       # shell: curl/tar/unar/git/rg/diff/pip --user (секреты вырезаны → authed через плагины)
+      - vault          # bitwarden: vault_get/list/field/totp
+      - telegram       # чтение тредов/истории + гейтинг чатов/DM (ингест-хук)
+      - cronjob        # расписания (напр. дайджест аудита ТП)
+      - delegation     # сабагенты для проверки выводов
+      - session_search
+      - todo
+      - memory
+      # read-only data plugins (creds в .env)
+      - github         # чтение репо/issue/PR WB
+      - youtrack       # тикеты: чтение + запись (yt_create_issue, yt_add_comment)
+      - jenkins        # Jenkins CI: job/build/log/trigger/search (токен parent-side из .env)
+      - google_docs    # чтение Google Docs
+      - google_sheets  # чтение Google Sheets
+      - image_gen      # генерация картинок
+      - discourse      # портал ТП support.wirenboard.com: поиск/треды/вложения — read-only, ответить нельзя
+    plugins: [curl-jina, github, youtrack, jenkins, google-docs, google-sheets, ssh, bitwarden, telegram-context, http-fetch, discourse]
+    bundled_plugins:
+      - web/ddgs           # web_search backend (no key)
+      - memory/holographic   # локальный SQLite fact_store (FTS5 + trust + HRR); provider ниже
+      - image_gen/openai   # генерация картинок через OpenAI (gpt-image), не OpenRouter
+      - platforms/telegram   # gateway-адаптер Telegram (kind: platform, auto-load; иначе "No adapter for telegram")
+    config:
+      web:
+        search_backend: ddgs
+        extract_backend: curl-jina
+      image_gen:
+        provider: openai      # gpt-image через OPENAI_API_KEY
+      memory:
+        provider: holographic   # локальный SQLite fact_store; БД per-agent в $HERMES_HOME (db=memory_store.db)
+        auto_extract: false     # встроенный auto_extract — EN-регекспы, для нас бесполезен; экстракцию делает САМ агент (LLM) вживую через fact_store — нудж в персоне (probe/add с именем в тексте → entity парсится стором)
+        user_profile_enabled: true  # профили участников
+    # bundled/optional skills (paths under repo skills/ or optional-skills/)
+    skills:
+      - research/arxiv
+      - research/blogwatcher
+      - data-science/jupyter-live-kernel
+      - software-development/systematic-debugging
+      - software-development/spike
+      - github/codebase-inspection   # issues/PR — через полные github_* тулы плагина
+      - research/searxng-search
+      - research/duckduckgo-search
+      - research/scrapling
+      - research/parallel-cli
+    # custom skills (dir names under base/skills/)
+    custom_skills:
+      - diagnostic-cross-weaving
+      - wb-troubleshooting
+      - wiren-board
+      - wb-serial
+      - wb-network
+      - wb-mqtt-broker
+      - wb-zigbee
+      - wb-code-research
+      - wb-support-portal-audit
+      - internet-archaeology
+      - wb-software-investigation
+      - wb-wiring                  # схемы подключения WB кодом (schemdraw): RS-485, питание, реле, входы
+      - ssh-guide                  # как работать по SSH (плагин ssh)
+      - vault-guide                # как доставать секреты из Bitwarden (плагин vault)
+      - telegram-guide             # чтение тредов + гейтинг чатов/DM
+      - youtrack-tasks             # работа с задачами YouTrack (yt_* тулы: поиск/создание/коммент)
+      - jenkins-ci                 # Jenkins CI: API-паттерны, аутентификация, разбор сборок (curl/http_fetch + vault)
+      - research                   # глубокий ресёрч + реконструкция контекста (обезличено, под наши тулы)
+      - product-discovery          # запрос/жалоба → боль/JTBD + разбор конкурентов
+      - diagrams                   # блок-схемы/принципиалки кодом (graphviz/schemdraw) → картинкой в чат

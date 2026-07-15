@@ -1,0 +1,9 @@
+name: http-fetch
+version: 1.0.0
+description: "Bounded HTTP(S) fetch tool (aka curl/wget) for agents with terminal disabled: GET/POST a URL with optional headers/body, size cap + timeout, body returned inline (text/JSON) or saved to file (binary/images). No secrets — no auth injection, no env tokens. Registers http_fetch into the web toolset."
+author: multi-agent
+kind: standalone
+requires_env: []
+provides_tools:
+  - http_fetch
+provides_hooks: []

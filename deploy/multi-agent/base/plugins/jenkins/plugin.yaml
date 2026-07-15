@@ -1,0 +1,14 @@
+name: jenkins
+version: 1.0.0
+description: "Jenkins CI integration — job/build info, console log, trigger build, search + list jobs. Auth parent-side from env (JENKINS_URL/JENKINS_USER/JENKINS_TOKEN): user+token = Pattern A (matrix-auth, WB), token-only = Pattern B (legacy). Token never reaches the model or the code_execution sandbox. Registers jenkins_* tools into the jenkins toolset."
+author: multi-agent
+kind: standalone
+requires_env: []
+provides_tools:
+  - jenkins_job_info
+  - jenkins_build_info
+  - jenkins_build_log
+  - jenkins_build_trigger
+  - jenkins_search
+  - jenkins_list_jobs
+provides_hooks: []

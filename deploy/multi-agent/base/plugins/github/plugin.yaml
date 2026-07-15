@@ -1,0 +1,19 @@
+name: github
+version: 1.0.0
+description: GitHub issue/PR management — list, filter, view, create issues; review, merge PRs
+provides_tools:
+  - github_issue_list
+  - github_issue_view
+  - github_issue_create
+  - github_pr_list
+  - github_pr_view
+  - github_pr_merge
+  - github_repo_search
+requires_env:
+  - name: GITHUB_TOKEN
+    description: "GitHub personal access token (repo scope)"
+    url: "https://github.com/settings/tokens"
+    secret: true
+optional_env:
+  - name: GITHUB_ALLOWED_REPOS
+    description: "Comma-separated list of allowed repos (e.g. 'owner/repo1,owner/repo2'). Empty = all repos allowed."

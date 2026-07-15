@@ -1,0 +1,13 @@
+# Generated + secret + runtime artifacts — never commit.
+render/
+docker-compose.generated.yml
+# real secrets (the *.example templates ARE committed as reference)
+instances/*/.env
+instances/*/memory.env
+instances/*/config.yaml
+instances/*/data/
+instances/*/secrets/
+__pycache__/
+*.pyc
+# local working note (temporary)
+DEPLOY-TOMORROW.md

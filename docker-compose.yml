@@ -64,6 +64,9 @@ services:
     image: hermes-agent
     container_name: hermes-dashboard
     restart: unless-stopped
+    # Off by default: `docker compose up -d` starts ONLY the gateway (no inbound
+    # listeners). Opt in explicitly with `docker compose --profile dashboard up -d`.
+    profiles: ["dashboard"]
     network_mode: host
     depends_on:
       - gateway

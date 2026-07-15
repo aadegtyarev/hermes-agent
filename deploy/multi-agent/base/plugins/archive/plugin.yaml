@@ -1,0 +1,11 @@
+name: archive
+version: 1.0.0
+description: "Archive tools — list, extract (zip/rar/RAR5/7z/tar/gz/bz2/xz via unar), create (.zip/.tar.*). Operates on container-local paths. A clean surface instead of ad-hoc code_execution."
+author: multi-agent
+kind: standalone
+requires_env: []
+provides_tools:
+  - archive_list
+  - archive_extract
+  - archive_create
+provides_hooks: []

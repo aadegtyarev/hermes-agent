@@ -1,0 +1,147 @@
+# Shared base config for every agent. render.py deep-merges each agent's
+# overrides from agents.yaml ON TOP of this, then writes the result to
+# instances/<name>/data/config.yaml (the per-instance $HERMES_HOME).
+#
+# This file encodes the LOCKDOWN posture. Anything not granted here or per-agent
+# is unreachable by the model:
+#   - platform_toolsets is a strict allowlist (render sets it to the agent's
+#     toolsets + `no_mcp`; `no_mcp` blocks every MCP server).
+#   - plugins.enabled is a strict allowlist (render sets it to the agent's plugins).
+#   - the curated HERMES_BUNDLED_PLUGINS / HERMES_BUNDLED_SKILLS dirs (built by
+#     render) mean upstream plugins/skills we didn't allow are not even present.
+
+model:
+  provider: deepseek               # нативный провайдер: base_url (api.deepseek.com/v1) резолвится из профиля, ключ ← DEEPSEEK_API_KEY (в instances/<agent>/.env)
+  api_key: ${DEEPSEEK_API_KEY}     # явно, чтобы не подхватить чужой/дефолтный ключ. base_url НЕ задаём: явный base_url ломает chat_completions-модели (deepseek/glm) — см. model_switch.py.
+  default: deepseek-v4-flash       # болталка: текстовая V4 Flash (дёшево+быстро); фоновые задачи (curator/compression/auto-extract) идут на ней же
+  # context_length НЕ задаём: hermes берёт реальное окно модели из метаданных.
+  # DeepSeek — ТЕКСТОВАЯ модель, vision НЕ поддерживает. Поэтому supports_vision НЕ ставим:
+  # инлайновые картинки уходят на auxiliary.vision (прямой OpenAI, см. ниже) через text-пайплайн
+  # — image_routing при non-vision основной модели + явном auxiliary.vision автоматически
+  # прогоняет vision_analyze и подставляет описание в промпт (image_routing.py). vision_analyze
+  # как тул тоже остаётся доступен агенту.
+
+# Сабагенты (delegate_task) идут на модели СИЛЬНЕЕ болталки (эскалация): deepseek-v4-pro
+# с reasoning_effort: high (против flash/medium у болталки) — кодинг/ревью, глубокое копание,
+# перепроверка выводов. Провайдер/ключ тот же нативный deepseek.
+delegation:
+  provider: deepseek
+  api_key: ${DEEPSEEK_API_KEY}          # явно: иначе сабагент НАСЛЕДУЕТ ключ родителя. base_url не задаём (нативный провайдер).
+  model: deepseek-v4-pro                # сильнее болталки (flash); глубокое копание/ревью/перепроверка
+  reasoning_effort: high                # усилие сабагента — high (болталка — medium); delegate_tool.py:1259 читает delegation.reasoning_effort
+
+# One SHARED brain per group chat: all participants share the session context.
+# Each message the model sees is prefixed with the sender's name ([Имя] …), so
+# it still tells speakers apart. false = shared; true = isolate per participant.
+group_sessions_per_user: false
+
+# STRICT toolset allowlist. Base is empty-but-for-no_mcp; render replaces the
+# telegram list with the agent's toolsets + no_mcp. An empty explicit list is
+# still an allowlist (the platform composite is NOT substituted).
+platform_toolsets:
+  telegram: [no_mcp]
+
+# Global hard denylist — subtracted from every platform, runs last.
+# terminal ВКЛЮЧЁН. Обе песочницы (terminal + code_execution) по умолчанию вырезают
+# секреты из дочернего процесса; в одном контейнере это defense-in-depth, не жёсткая
+# граница. Authed-операции (github/jenkins/youtrack/bw/ssh) идут плагинами parent-side.
+agent:
+  disabled_toolsets: []
+  reasoning_effort: medium    # усилие рассуждения основной модели (болталки) — medium (DeepSeek: low|medium|high|max). Сабагент сильнее — high (см. delegation.reasoning_effort).
+
+# STRICT plugin allowlist (render fills per agent). Bundled backend/platform
+# kinds bypass this, which is why we also curate HERMES_BUNDLED_PLUGINS.
+plugins:
+  enabled: []
+  disabled: []
+
+# Memory: builtin (MEMORY.md/USER.md under $HERMES_HOME) by default — no plugin
+# needed, fully per-instance. Switch to a DB provider per agent if wanted.
+memory:
+  provider: builtin
+  memory_enabled: true
+  user_profile_enabled: true
+
+# vision_analyze требует vision-способную модель (иначе тул падает).
+# Основная модель теперь DeepSeek (текстовая) → vision-фолбек ОСТАЁТСЯ на прямом OpenAI.
+auxiliary:
+  vision:
+    provider: custom      # прямой OpenAI (НЕ DeepSeek — он картинки не умеет)
+    base_url: https://api.openai.com/v1
+    api_key: ${OPENAI_API_KEY}   # ЯВНО: основная модель — DeepSeek, поэтому ключ OpenAI берём напрямую (auxiliary_client.py:4616 иначе тянет env OPENAI_API_KEY, но фиксируем явно)
+    model: gpt-5.4-nano   # vision-анализ — nano мультимодальный на вход (image), дёшево
+
+# Per-instance custom skills live under $HERMES_HOME/skills (WRITABLE — the agent
+# may edit and add skills via skill_manage). HERMES_BUNDLED_SKILLS points at an
+# empty curated dir so upstream image skills stay blocked (allowlist).
+# BSI (Background Self-Improvement): the agent is nudged to distil skills and
+# writes them without approval.
+skills:
+  external_dirs:
+    - ${HERMES_HOME}/skills
+  creation_nudge_interval: 10   # ~каждые 10 tool-итераций — проверка на создание скилла
+  write_approval: false          # пишет скиллы сразу, без подтверждения
+  guard_agent_created: false     # не блокирует созданные агентом скиллы
+
+# Curator — периодическая уборка/консолидация скиллов и памяти (с авто-бэкапом).
+curator:
+  enabled: true
+  interval_hours: 168            # раз в 7 дней
+  min_idle_hours: 2              # только когда агент неактивен ≥2ч
+  stale_after_days: 30           # 30 дней без использования → stale
+  archive_after_days: 90         # 90 дней → в архив
+  consolidate: true              # LLM-консолидация (опциональная фаза)
+  prune_builtins: true           # архивирует неиспользуемые built-in скиллы
+  backup:
+    enabled: true                # авто-снапшот перед каждым проходом
+    keep: 5                      # хранить 5 последних снапшотов
+
+compression:
+  enabled: true
+  threshold: 0.65
+  protect_last_n: 30
+
+# In groups, respond only when addressed.
+platforms:
+  telegram:
+    require_mention: true
+    # Гейт СЛЭШ-КОМАНД (ось отдельная от TELEGRAM_ADMIN_USERS, который гейтит только
+    # /hermes_*). Без admin-списка ядро в open-режиме: ЛЮБОЙ участник группы может
+    # запустить ЛЮБУЮ команду (/whoami показывал «Tier: unrestricted»). Задаём
+    # оператора → гейтинг включается: не-оператор получает только /help,/whoami (пол),
+    # остальные слэш-команды → ⛔. Обычный чат не трогается — гейтятся лишь команды.
+    # Ключи мостятся в extra штатно (gateway/config.py). Расширить права не-админам —
+    # group_user_allowed_commands / user_allowed_commands.
+    allow_admin_from: ["662750197"]          # DM-скоуп: оператор слэш-команд
+    group_allow_admin_from: ["662750197"]    # групповой скоуп: оператор слэш-команд
+
+# Полный контроль агента над выданными тулами — без approval-запросов.
+approvals:
+  mode: "off"
+
+# Чистый чат: только финальный ответ. Убираем весь служебный мусор —
+# прогресс вызова тулов, «размышления», промежуточные реплики, статусы,
+# busy-ack и heartbeat-уведомления; residual-пузыри удаляем после ответа.
+display:
+  tool_progress: new              # дефолт — verbose new (показываем новые вызовы тулов); на лету /verbose (off→new→all→verbose→log)
+  tool_progress_command: true     # включает /verbose в мессенджер-гейтвее (иначе команда недоступна)
+  busy_input_mode: steer          # сообщение, пришедшее пока агент занят, ПОДМЕШИВается в текущий ран (после ближайшего тула), не обрывая. Дефолт ядра — interrupt. (/busy в Telegram недоступна — cli_only без gate; меняется только тут.)
+  tool_preview_length: 0
+  show_reasoning: false           # рекап рассуждений после ответа — off по умолчанию (тумблер /reasoning show|hide). Живой поток (thinking_progress) не включаем — не зашёл.
+  memory_notifications: "off"     # Self-improvement review (фоновый обзор памяти/скиллов) продолжает работать и писать, но строку «💾 …» в чат НЕ шлём (дефолт ядра — on)
+  interim_assistant_messages: false
+  long_running_notifications: false
+  busy_ack_detail: false
+  busy_steer_ack_enabled: false
+  cleanup_progress: true          # residual-пузыри тулов удаляются после ответа (мусор не копится)
+  streaming: false
+
+# Выключаем one-time onboarding-подсказки (busy /busy, /verbose tip и пр.) — не для
+# новичков. Флаги помечены «seen» → hints не вылезают. (Раньше лезли каждый раз, т.к.
+# config был :ro и mark_seen не мог сохранить флаг.)
+onboarding:
+  seen:
+    busy_input_prompt: true
+    tool_progress_prompt: true
+    openclaw_residue_cleanup: true
+    profile_build_offered: true

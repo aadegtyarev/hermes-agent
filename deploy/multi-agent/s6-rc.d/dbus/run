@@ -1,0 +1,8 @@
+#!/command/with-contenv sh
+# shellcheck shell=sh
+# System D-Bus daemon — required by avahi-daemon (and avahi-browse/-resolve).
+# Runs as ROOT (not wrapped in s6-setuidgid, unlike main-hermes/dashboard).
+mkdir -p /run/dbus
+# dbus refuses to start without a machine-id; --ensure is idempotent.
+dbus-uuidgen --ensure
+exec dbus-daemon --system --nofork --nopidfile

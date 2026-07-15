@@ -1,0 +1,13 @@
+name: telegram-context
+version: 1.0.0
+description: "Telegram ingest + gating + thread reconstruction. One pre_gateway_dispatch hook: chat allowlist (work vs read-only vs ignore, env ∪ runtime store), auto-collected DM allowlist (work-chat members, getChatMember-verified), message ingest, and /hermes_* admin commands to enrol/drop the current chat at runtime (no file edits). Tools: telegram_thread/recent/search/dm_allowlist. Env: TELEGRAM_WORK_CHATS, TELEGRAM_READONLY_CHATS, TELEGRAM_DM_EXTRA_USERS, TELEGRAM_ADMIN_USERS."
+author: multi-agent
+kind: standalone
+requires_env: []
+provides_tools:
+  - telegram_thread
+  - telegram_recent
+  - telegram_search
+  - telegram_dm_allowlist
+provides_hooks:
+  - pre_gateway_dispatch

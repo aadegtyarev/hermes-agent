@@ -171,6 +171,13 @@ VALID_HOOKS: Set[str] = {
     #   {"action": "allow"}  /  None             -> normal dispatch
     # Kwargs: event: MessageEvent, gateway: GatewayRunner, session_store.
     "pre_gateway_dispatch",
+    # Fired by the Telegram platform adapter when a member leaves/is removed
+    # from a group the bot is in (legacy message.left_chat_member service
+    # field — works for any bot, no admin rights needed). Observer-style:
+    # return values are ignored. Lets plugins that grant chat-scoped access
+    # (e.g. telegram-context's auto-pairing) revoke it on the way out.
+    # Kwargs: chat_id: str, chat_title: str, user_id: str, user_name: str.
+    "telegram_chat_member_left",
     # Approval lifecycle hooks. Fired by tools/approval.py when a dangerous
     # command needs user approval -- fires BOTH for CLI-interactive prompts
     # and for gateway/ACP approvals (Telegram, Discord, Slack, TUI, etc.).

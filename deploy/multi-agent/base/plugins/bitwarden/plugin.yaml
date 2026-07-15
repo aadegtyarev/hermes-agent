@@ -1,0 +1,13 @@
+name: bitwarden
+version: 1.0.0
+description: "Bitwarden/Vaultwarden vault — fetch a specific secret on demand (vault_list/get/field/totp) via the bw CLI. Auto login+unlock (BW_CLIENTID/BW_CLIENTSECRET/BW_PASSWORD, optional BW_SERVER), session cached. Access audit-logged; creds are env (scrubbed from the sandbox)."
+author: multi-agent
+kind: standalone
+requires_env: []
+provides_tools:
+  - vault_list
+  - vault_get
+  - vault_field
+  - vault_totp
+provides_hooks:
+  - post_tool_call

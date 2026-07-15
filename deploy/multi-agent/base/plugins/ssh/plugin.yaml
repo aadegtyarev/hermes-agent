@@ -1,0 +1,20 @@
+name: ssh
+version: 1.0.0
+description: "Bounded SSH — run commands, read files, list paths on ALLOWLISTED hosts (SSH_ALLOWED_HOSTS). Non-interactive (BatchMode), per-call timeout, output-truncated, audit-logged. Key via SSH_KEY. A narrow surface instead of a raw shell."
+author: multi-agent
+kind: standalone
+requires_env: []
+provides_tools:
+  - ssh_run
+  - ssh_read_file
+  - ssh_list
+  - ssh_put
+  - ssh_start
+  - ssh_poll
+  - ssh_send
+  - ssh_stop
+  - ssh_sessions
+  - ssh_keygen
+  - ssh_copy_id
+provides_hooks:
+  - post_tool_call

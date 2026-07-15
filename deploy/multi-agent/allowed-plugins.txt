@@ -1,0 +1,15 @@
+# Upstream BUNDLED plugins to expose to agents (path under the repo `plugins/`).
+# One per line; blank lines and #-comments ignored. Categories use `cat/name`.
+#
+# render.py copies each listed path into the curated bundled-plugins dir that
+# HERMES_BUNDLED_PLUGINS points at, together with all custom plugins from
+# base/plugins/. Anything NOT listed here (and not a custom plugin) is absent
+# from the curated dir, so it can never load — a true allowlist that survives
+# `git pull origin`.
+#
+# The 6 custom plugins (curl-jina, image-gen, github, youtrack, google-docs,
+# google-sheets) are ALWAYS included from base/plugins/ — do not list them here.
+#
+# Add upstream bundled plugins an agent needs. Examples (uncomment as needed):
+# web/ddgs          # web_search backend (DuckDuckGo, no key) — needed for web_search
+# disk-cleanup      # auto-remove ephemeral files via session hooks

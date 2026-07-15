@@ -1016,6 +1016,11 @@ from agent.replay_cleanup import (  # noqa: E402
 _AUTO_CONTINUE_NOTE_PREFIX = "[System note: Your previous turn"
 _AUTO_CONTINUE_FALLBACK_PREFIX = "[System note: A new message"
 
+# Marks a synthetic turn enqueued to tell the agent that a file it tried to
+# attach could not be delivered. One-shot: a feedback turn never spawns another
+# feedback turn, so a repeatedly-failing attachment can't loop.
+_MEDIA_DELIVERY_FEEDBACK_FLAG = "media_delivery_feedback"
+
 
 def _is_auto_continue_noise(content: Any) -> bool:
     """Return True if this user-message content is a gateway-injected
@@ -11396,7 +11401,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         # One-time prompt if no home channel is set for this platform
         # Skip for webhooks - they deliver directly to configured targets (github_comment, etc.)
-        if not history and source.platform and source.platform != Platform.LOCAL and source.platform != Platform.WEBHOOK:
+        # onboarding.home_channel_notice: false suppresses this without requiring /sethome.
+        if (
+            not history
+            and source.platform
+            and source.platform != Platform.LOCAL
+            and source.platform != Platform.WEBHOOK
+            and _load_gateway_config().get("onboarding", {}).get("home_channel_notice", True)
+        ):
             platform_name = source.platform.value
             env_key = _home_target_env_var(platform_name)
             if not os.getenv(env_key):
@@ -13116,7 +13128,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # send_multiple_images (Telegram sendPhoto recompresses to ~1280px).
             force_document_attachments = "[[as_document]]" in response
 
-            from gateway.platforms.base import BasePlatformAdapter, should_send_media_as_audio
+            from gateway.platforms.base import (
+                BasePlatformAdapter,
+                should_send_media_as_audio,
+                explain_media_delivery_rejection,
+                validate_media_delivery_path,
+                MEDIA_EXTENSIONLESS_TAG_RE,
+                _normalize_media_tag_path,
+            )
+
+            # (path, reason) for every file the agent asked to attach that the
+            # user did NOT receive. Fed back to the agent (or, on a feedback
+            # turn, surfaced directly) so the failure is explained with a fix.
+            delivery_failures: list = []
+            # Outbound attachment size cap, if the adapter exposes one. Files
+            # over the cap are refused up front with an actionable reason
+            # instead of a raw platform API error.
+            _max_send = int(getattr(adapter, "max_send_document_bytes", 0) or 0)
+
+            def _oversize_reason(_path: str):
+                if _max_send <= 0:
+                    return None
+                try:
+                    _size = os.path.getsize(_path)
+                except OSError:
+                    return None
+                if _size <= _max_send:
+                    return None
+                return (
+                    f"file is {_size / (1024 * 1024):.1f} MB, over the "
+                    f"{_max_send // (1024 * 1024)} MB attachment limit"
+                )
 
             media_files, cleaned = adapter.extract_media(response)
             media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
@@ -13170,52 +13212,158 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception as e:
                     logger.warning("[%s] Post-stream image batch delivery failed: %s", adapter.name, e)
 
-            for media_path, is_voice in non_image_media:
+            async def _send_one(_path, _is_voice, *, allow_voice):
+                """Send one file; return None on success or a failure reason."""
+                too_big = _oversize_reason(_path)
+                if too_big:
+                    return too_big
                 try:
-                    ext = Path(media_path).suffix.lower()
-                    if should_send_media_as_audio(event.source.platform, ext, is_voice=is_voice):
-                        await adapter.send_voice(
+                    ext = Path(_path).suffix.lower()
+                    if allow_voice and should_send_media_as_audio(
+                        event.source.platform, ext, is_voice=_is_voice
+                    ):
+                        res = await adapter.send_voice(
                             chat_id=event.source.chat_id,
-                            audio_path=media_path,
+                            audio_path=_path,
                             metadata=_thread_meta,
                         )
                     elif ext in _VIDEO_EXTS:
-                        await adapter.send_video(
+                        res = await adapter.send_video(
                             chat_id=event.source.chat_id,
-                            video_path=media_path,
+                            video_path=_path,
                             metadata=_thread_meta,
                         )
                     else:
-                        await adapter.send_document(
+                        res = await adapter.send_document(
                             chat_id=event.source.chat_id,
-                            file_path=media_path,
+                            file_path=_path,
                             metadata=_thread_meta,
                         )
                 except Exception as e:
                     logger.warning("[%s] Post-stream media delivery failed: %s", adapter.name, e)
+                    return f"delivery error: {e}"
+                if res is not None and getattr(res, "success", True) is False:
+                    return getattr(res, "error", None) or "delivery failed"
+                return None
+
+            for media_path, is_voice in non_image_media:
+                reason = await _send_one(media_path, is_voice, allow_voice=True)
+                if reason:
+                    delivery_failures.append((media_path, reason))
 
             for file_path in non_image_local:
-                try:
-                    ext = Path(file_path).suffix.lower()
-                    if ext in _VIDEO_EXTS:
-                        await adapter.send_video(
-                            chat_id=event.source.chat_id,
-                            video_path=file_path,
-                            metadata=_thread_meta,
-                        )
-                    else:
-                        await adapter.send_document(
-                            chat_id=event.source.chat_id,
-                            file_path=file_path,
-                            metadata=_thread_meta,
-                        )
-                except Exception as e:
-                    logger.warning("[%s] Post-stream file delivery failed: %s", adapter.name, e)
+                reason = await _send_one(file_path, False, allow_voice=False)
+                if reason:
+                    delivery_failures.append((file_path, reason))
+
+            # MEDIA: tags whose path never validated (missing / blocked path)
+            # were left visible in the text and never attempted — explain those
+            # too, so the agent can tell the user what to fix. Reuse the same
+            # example-masking as extract_media so documentation/code samples are
+            # never flagged.
+            try:
+                _attempted = {os.path.expanduser(p) for p, _ in media_files}
+                _attempted |= {os.path.expanduser(p) for p in local_files}
+                _scan = BasePlatformAdapter._mask_protected_spans(response)
+                _scan = BasePlatformAdapter._mask_json_string_media(_scan)
+                _seen_reject: set = set()
+                for _m in MEDIA_EXTENSIONLESS_TAG_RE.finditer(_scan):
+                    _p = _normalize_media_tag_path(_m.group("path"))
+                    if not _p:
+                        continue
+                    _exp = os.path.expanduser(_p)
+                    if _exp in _attempted or _exp in _seen_reject:
+                        continue
+                    if validate_media_delivery_path(_p):
+                        continue  # would have been delivered; defensive
+                    _reason = explain_media_delivery_rejection(_p)
+                    if _reason:
+                        _seen_reject.add(_exp)
+                        delivery_failures.append((_p, _reason))
+            except Exception as _e:
+                logger.debug("media rejection scan failed: %s", _e)
+
+            if delivery_failures:
+                await self._handle_media_delivery_failures(
+                    event, adapter, delivery_failures,
+                )
 
         except Exception as e:
             logger.warning("Post-stream media extraction failed: %s", e)
 
+    async def _handle_media_delivery_failures(
+        self,
+        event: MessageEvent,
+        adapter,
+        failures: list,
+    ) -> None:
+        """React when file attachment(s) the agent emitted could not be sent.
 
+        Default: enqueue a synthetic follow-up turn describing the failure so
+        the agent explains it to the user in their own voice and recommends a
+        fix (pack into an archive, share a link, move a blocked file). One-shot
+        — a feedback turn (``_MEDIA_DELIVERY_FEEDBACK_FLAG``) never spawns
+        another; if delivery still fails on that turn we fall back to a terse
+        deterministic note so the user is never left in silence.
+        """
+        try:
+            lines = []
+            for path, reason in failures:
+                name = os.path.basename(str(path).rstrip("/")) or str(path)
+                lines.append(f"- {name}: {reason}")
+            detail = "\n".join(lines)
+
+            is_feedback_turn = bool(
+                (getattr(event, "metadata", None) or {}).get(_MEDIA_DELIVERY_FEEDBACK_FLAG)
+            )
+            source = event.source
+            _thread_meta = self._thread_metadata_for_source(
+                source, self._reply_anchor_for_event(event)
+            )
+
+            if is_feedback_turn:
+                # Loop guard: do not enqueue again. Tell the user plainly.
+                note = (
+                    "⚠️ Не удалось приложить файл(ы):\n"
+                    f"{detail}\n"
+                    "Попробуй упаковать в архив (при необходимости с разбивкой "
+                    "на тома) или дай ссылку на скачивание."
+                )
+                try:
+                    await adapter.send(source.chat_id, note, metadata=_thread_meta)
+                except Exception as exc:
+                    logger.debug("media failure fallback note send failed: %s", exc)
+                return
+
+            note = (
+                "[System note: file delivery] Your reply asked to attach the "
+                "following file(s), but delivery FAILED and the user did NOT "
+                "receive them:\n"
+                f"{detail}\n"
+                "Briefly tell the user what went wrong, in their language, and "
+                "suggest a workaround: for an over-limit file, pack it into an "
+                "archive (split into volumes if needed) or share a download "
+                "link; for a blocked/system path, move the file somewhere "
+                "deliverable. Do NOT re-emit a MEDIA: tag for a file that just "
+                "failed for the same reason."
+            )
+            try:
+                _quick_key = self._session_key_for_source(source)
+                if _quick_key:
+                    cont_event = MessageEvent(
+                        text=note,
+                        message_type=MessageType.TEXT,
+                        source=source,
+                        internal=True,
+                        message_id=None,
+                        channel_prompt=None,
+                        metadata={_MEDIA_DELIVERY_FEEDBACK_FLAG: True},
+                    )
+                    self._enqueue_fifo(_quick_key, cont_event, adapter)
+            except Exception as exc:
+                logger.debug("media failure feedback enqueue failed: %s", exc)
+        except Exception as exc:
+            logger.debug("media delivery failure handling failed: %s", exc)
 
     async def _run_background_task(
         self,

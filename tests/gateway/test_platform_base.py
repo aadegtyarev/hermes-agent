@@ -696,6 +696,31 @@ class TestExtensionlessMediaDelivery:
         stripped = BasePlatformAdapter.strip_media_directives_for_display(text)
         assert "MEDIA:" not in stripped
 
+    def test_unknown_extension_media_extracted_when_file_validates(self, tmp_path, monkeypatch):
+        """A MEDIA: tag with an unknown-but-present extension (.deb) delivers."""
+        root = tmp_path / "output"
+        root.mkdir()
+        pkg = root / "curtain-m300_1.0.0_all.deb"
+        pkg.write_bytes(b"!<arch>\n")
+        self._patch_allow_root(monkeypatch, root)
+
+        content = f"Вот пакет:\nMEDIA:{pkg}\nГотово."
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+        assert len(media) == 1
+        assert media[0][0] == str(pkg.resolve())
+        assert "MEDIA:" not in cleaned
+        assert "Готово." in cleaned
+
+    def test_unknown_extension_media_left_visible_when_not_on_disk(self, tmp_path, monkeypatch):
+        root = tmp_path / "output"
+        root.mkdir()
+        self._patch_allow_root(monkeypatch, root)
+
+        content = "MEDIA:/nonexistent/pkg.deb"
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+        assert media == []
+        assert "MEDIA:/nonexistent/pkg.deb" in cleaned
+
     def test_as_document_directive_stripped_without_media_tag(self):
         """[[as_document]] must be stripped even when no MEDIA: tag is present.
 
@@ -710,6 +735,37 @@ class TestExtensionlessMediaDelivery:
         assert "[[as_document]]" not in (
             BasePlatformAdapter.strip_media_directives_for_display(text)
         )
+
+
+class TestExplainMediaDeliveryRejection:
+    """explain_media_delivery_rejection classifies why a path is undeliverable."""
+
+    def test_none_for_deliverable_file(self, tmp_path, monkeypatch):
+        from gateway.platforms.base import explain_media_delivery_rejection
+        monkeypatch.delenv("HERMES_MEDIA_DELIVERY_STRICT", raising=False)
+        f = tmp_path / "ok.deb"
+        f.write_bytes(b"!<arch>\n")
+        assert explain_media_delivery_rejection(str(f)) is None
+
+    def test_reason_for_missing_file(self, monkeypatch):
+        from gateway.platforms.base import explain_media_delivery_rejection
+        monkeypatch.delenv("HERMES_MEDIA_DELIVERY_STRICT", raising=False)
+        reason = explain_media_delivery_rejection("/nonexistent/pkg.deb")
+        assert reason and "not found" in reason.lower()
+
+    def test_reason_for_relative_path(self, monkeypatch):
+        from gateway.platforms.base import explain_media_delivery_rejection
+        monkeypatch.delenv("HERMES_MEDIA_DELIVERY_STRICT", raising=False)
+        reason = explain_media_delivery_rejection("relative/pkg.deb")
+        assert reason and "absolute" in reason.lower()
+
+    def test_reason_for_denylisted_path(self, monkeypatch):
+        from gateway.platforms.base import explain_media_delivery_rejection
+        monkeypatch.delenv("HERMES_MEDIA_DELIVERY_STRICT", raising=False)
+        # /etc/passwd exists on Linux and is on the credential/system denylist.
+        reason = explain_media_delivery_rejection("/etc/passwd")
+        if reason is not None:  # skip if /etc/passwd absent (non-Linux CI)
+            assert "blocked" in reason.lower()
 
 
 class TestMediaDeliveryPathValidation:

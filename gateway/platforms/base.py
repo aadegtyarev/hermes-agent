@@ -1319,6 +1319,66 @@ def validate_media_delivery_path(path: str) -> Optional[str]:
     return None
 
 
+def explain_media_delivery_rejection(path: str) -> Optional[str]:
+    """Classify why ``validate_media_delivery_path`` refused ``path``.
+
+    Returns a short human-readable reason when the path is NOT deliverable, or
+    ``None`` when the path actually validates (i.e. it would be delivered). The
+    reason is fed back to the agent so it can explain the failure to the user
+    and recommend a fix (e.g. move the file out of a blocked location). Mirrors
+    the decision order in ``validate_media_delivery_path``.
+    """
+    if not path:
+        return "empty path"
+
+    candidate = str(path).strip()
+    if len(candidate) >= 2 and candidate[0] == candidate[-1] and candidate[0] in "`\"'":
+        candidate = candidate[1:-1].strip()
+    candidate = candidate.lstrip("`\"'").rstrip("`\"',.;:)}]")
+    if not candidate:
+        return "empty path"
+
+    try:
+        expanded = Path(os.path.expanduser(candidate))
+    except (OSError, RuntimeError, ValueError):
+        return "invalid path"
+    if not expanded.is_absolute():
+        return "path is not absolute (must start with / or ~/)"
+
+    try:
+        resolved = expanded.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return "file not found"
+
+    if not resolved.is_file():
+        return "not a regular file (directory or special file)"
+
+    # A path under an allowlisted root or the cache is always deliverable.
+    for root in _media_delivery_allowed_roots():
+        try:
+            resolved_root = root.expanduser().resolve(strict=False)
+        except (OSError, RuntimeError, ValueError):
+            continue
+        if _path_is_within(resolved, resolved_root):
+            return None
+
+    if not _media_delivery_strict_mode():
+        if _path_under_denied_prefix(resolved):
+            return "blocked: system/credential path (not allowed for delivery)"
+        return None
+
+    # Strict mode: only cache/allowlist/recently-produced files are allowed.
+    if _path_under_denied_prefix(resolved):
+        return "blocked: system/credential path (not allowed for delivery)"
+    window = _media_delivery_recency_seconds()
+    if window > 0 and _file_is_recently_produced(resolved, window):
+        return None
+    return (
+        "blocked in strict delivery mode: file is not in an allowed directory "
+        "and was not freshly produced"
+    )
+
+
 # Neutralise control chars and the Unicode line separators (NEL, LS, PS) that
 # str.splitlines() / log aggregators treat as breaks, so a model-emitted path
 # can't forge a second log line. Truncated to keep records bounded.
@@ -1473,12 +1533,17 @@ MEDIA_TAG_CLEANUP_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Extension-less absolute paths (e.g. Caddyfile, Dockerfile, Makefile) are
-# intentionally excluded from MEDIA_TAG_CLEANUP_RE — they are validated and
-# delivered via MEDIA_EXTENSIONLESS_TAG_RE so prompt-injection paths that do
-# not exist on disk are left visible instead of silently dropped. Paths with
-# an unknown but present extension (e.g. .weirdext) stay on the #34517
-# bare-path fallback and are not handled here.
+# Fallback matcher for any ``MEDIA:<path>`` whose path is NOT one of the known
+# deliverable extensions in MEDIA_TAG_CLEANUP_RE — i.e. extension-less paths
+# (Caddyfile, Dockerfile, Makefile) AND paths with an unknown-but-present
+# extension (.deb, .rpm, .weirdext, …). An explicit MEDIA: tag is an intent
+# signal from the agent, so the gate here is existence + denylist via
+# ``validate_media_delivery_path`` rather than an extension allowlist: any real
+# file the user could have uploaded, the agent can hand back (except
+# credentials/system paths). Prompt-injection / example paths that do not exist
+# on disk fail validation and are left visible instead of delivered. The bare
+# (untagged) path detector ``extract_local_files`` deliberately keeps the
+# extension allowlist — it is a heuristic, not an explicit request.
 MEDIA_EXTENSIONLESS_TAG_RE = re.compile(
     r'''[`"']?MEDIA:\s*'''
     r'''(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|'''
@@ -1495,11 +1560,6 @@ def _normalize_media_tag_path(raw: str) -> str:
     return path.lstrip("`\"'").rstrip("`\"',.;:)}]")
 
 
-def _path_lacks_deliverable_extension(path: str) -> bool:
-    """True only when the basename has no extension (Caddyfile, Makefile, …)."""
-    return not Path(path).suffix
-
-
 def _strip_media_tag_directives(text: str) -> str:
     """Remove MEDIA: tags and [[audio_as_voice]] / [[as_document]] markers."""
     if (
@@ -1511,8 +1571,11 @@ def _strip_media_tag_directives(text: str) -> str:
     cleaned = text.replace("[[audio_as_voice]]", "").replace("[[as_document]]", "")
 
     def _strip_extensionless(match: re.Match) -> str:
+        # Any MEDIA: path the known-extension pass did not already strip:
+        # remove it only when it validates as a real, deliverable file so an
+        # undeliverable/example path stays visible for debugging.
         path = _normalize_media_tag_path(match.group("path"))
-        if not path or not _path_lacks_deliverable_extension(path):
+        if not path:
             return match.group(0)
         return "" if validate_media_delivery_path(path) else match.group(0)
 
@@ -3640,8 +3703,11 @@ class BasePlatformAdapter(ABC):
 
         seen_paths = {p for p, _ in media}
         for match in MEDIA_EXTENSIONLESS_TAG_RE.finditer(scan_content):
+            # Fallback pass: any MEDIA: path not already claimed by the
+            # known-extension pass (extension-less OR unknown-extension like
+            # .deb). Gated by existence + denylist so only real files deliver.
             path = _normalize_media_tag_path(match.group("path"))
-            if not path or not _path_lacks_deliverable_extension(path):
+            if not path:
                 continue
             safe = validate_media_delivery_path(path)
             if safe and safe not in seen_paths:
@@ -3662,7 +3728,7 @@ class BasePlatformAdapter(ABC):
             spans = [m.span() for m in media_pattern.finditer(masked_cleaned)]
             for match in MEDIA_EXTENSIONLESS_TAG_RE.finditer(masked_cleaned):
                 path = _normalize_media_tag_path(match.group("path"))
-                if not path or not _path_lacks_deliverable_extension(path):
+                if not path:
                     continue
                 if validate_media_delivery_path(path):
                     spans.append(match.span())

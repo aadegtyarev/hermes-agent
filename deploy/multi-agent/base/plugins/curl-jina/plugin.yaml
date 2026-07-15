@@ -1,0 +1,7 @@
+name: web-curl-jina
+version: 1.0.0
+description: "Free web_extract backend with no local browser. Tier 1: fetch HTML over the proxy and extract markdown with lxml. Tier 2: JS-rendered / thin pages fall back to Jina AI Reader (r.jina.ai), which renders remotely. Optional JINA_API_KEY raises the Reader rate limit. Select via web.extract_backend: curl-jina."
+author: Alexander Degtyarev
+kind: backend
+provides_web_providers:
+  - curl-jina
