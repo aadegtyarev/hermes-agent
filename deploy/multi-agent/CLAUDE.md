@@ -29,6 +29,13 @@ chown data+config -> 10001:10001              # вернуть агенту
 docker compose ... up -d hermes-gpio
 ```
 
+## НЕ сноси `data/skills` — там накопленные агентские скиллы
+`instances/gpio/data/skills/` (`/opt/data/skills`, writable, gitignored) хранит
+**важные** скиллы, которые агент накопил через `skill_manage` (их нет в репе).
+**НИКОГДА не `rm -rf data/skills` целиком.** Стандартный `render.py` их сохраняет
+(copy-if-absent). Детали и как обновлять base-скилл точечно — `SERVER-DEPLOY.md`,
+раздел «Откат / пересборка».
+
 ## Перечитать config.yaml
 `config.yaml` — бинд-маунт. Если менялся ТОЛЬКО он (например слаги моделей), а
 `docker-compose.generated.yml` — нет, то `up -d` покажет «Running» и НЕ пересоздаст
