@@ -140,6 +140,10 @@ display:
 # новичков. Флаги помечены «seen» → hints не вылезают. (Раньше лезли каждый раз, т.к.
 # config был :ro и mark_seen не мог сохранить флаг.)
 onboarding:
+  # Не слать «📬 No home channel is set… /sethome» при первом сообщении из нового
+  # чата: home channel в этом деплое намеренно не задаётся (доставка — origin/local),
+  # подсказка только мусорит. Гейтит gateway/run.py (onboarding.home_channel_notice).
+  home_channel_notice: false
   seen:
     busy_input_prompt: true
     tool_progress_prompt: true
