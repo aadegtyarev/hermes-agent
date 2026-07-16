@@ -13,6 +13,7 @@
 #   - lxml                      -> curl-jina web_extract (Tier-1 HTML parse)
 #   - google-api-python-client  -> google-docs / google-sheets
 #   - google-auth[-oauthlib]    -> google-* auth (token / service account)
+#   - chromium                  -> browser toolset (agent-browser finds system Chrome)
 ARG BASE_IMAGE=hermes-agent:base
 FROM ${BASE_IMAGE}
 
@@ -29,8 +30,14 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
  && apt-get install -y --no-install-recommends \
       gh unar p7zip-full sshpass \
       avahi-daemon avahi-utils libnss-mdns dbus \
+      chromium fonts-liberation \
  && rm -rf /var/lib/apt/lists/*
 # gh                       -> github plugin
+# chromium + fonts-liberation -> browser toolset: the `agent-browser` CLI
+#   discovers a SYSTEM Chrome (/usr/bin/chromium) — the base image only ships
+#   chrome-headless-shell (playwright --only-shell), which agent-browser does
+#   NOT find, so its tools failed with "Chrome not found". Debian chromium is
+#   self-contained; fonts-liberation fixes headless text rendering.
 # unar, p7zip              -> archive plugin / code_execution: unar covers zip/rar/RAR5/7z
 # sshpass                  -> ssh plugin: non-interactive login/password auth
 # (openssh-client — ssh/ssh-keygen/scp — is already in the base image)
@@ -77,14 +84,6 @@ RUN uv pip install --python /opt/hermes/.venv/bin/python --no-cache-dir \
 # Bitwarden CLI for the bitwarden (vault) plugin. Node is present in the full
 # base image; the standalone `bw` binary would also work.
 RUN npm install -g @bitwarden/cli && npm cache clean --force
-
-# Full Chromium for the browser toolset. The base image installs only
-# chrome-headless-shell (`playwright install --only-shell`), which lacks a real
-# headful/full browser. Install the full Chromium into the same
-# PLAYWRIGHT_BROWSERS_PATH (/opt/hermes/.playwright, baked into the image, not a
-# volume) so it persists across container recreation. --with-deps pulls the
-# extra system libs full Chromium needs beyond the headless-shell set.
-RUN cd /opt/hermes && npx playwright install --with-deps chromium
 
 # mDNS: publish-disabled avahi config + s6 services (dbus + avahi-daemon, root).
 # With publishing off, the container's avahi resolves/browses the LAN but never
