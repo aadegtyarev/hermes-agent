@@ -78,6 +78,14 @@ RUN uv pip install --python /opt/hermes/.venv/bin/python --no-cache-dir \
 # base image; the standalone `bw` binary would also work.
 RUN npm install -g @bitwarden/cli && npm cache clean --force
 
+# Full Chromium for the browser toolset. The base image installs only
+# chrome-headless-shell (`playwright install --only-shell`), which lacks a real
+# headful/full browser. Install the full Chromium into the same
+# PLAYWRIGHT_BROWSERS_PATH (/opt/hermes/.playwright, baked into the image, not a
+# volume) so it persists across container recreation. --with-deps pulls the
+# extra system libs full Chromium needs beyond the headless-shell set.
+RUN cd /opt/hermes && npx playwright install --with-deps chromium
+
 # mDNS: publish-disabled avahi config + s6 services (dbus + avahi-daemon, root).
 # With publishing off, the container's avahi resolves/browses the LAN but never
 # announces its own name, so it coexists with a host avahi on 5353 (no conflict).
