@@ -180,6 +180,17 @@ def seed_instance(agent: dict, base_cfg: dict, enabled_plugins: List[str]) -> Pa
     if "model" in agent:
         cfg["model"] = deep_merge(cfg.get("model", {}), agent["model"])
 
+    # Server-only LOCAL overrides (gitignored) — survive re-render WITHOUT living
+    # in the repo. Each top-level key present in instances/<name>/config.local.yaml
+    # REPLACES that whole section in the rendered config (not deep-merge: that lets
+    # an override drop inherited keys, e.g. switch `model`/`delegation` to an OAuth
+    # provider without the base `api_key: ${...}` lingering). Used e.g. to pin the
+    # openai-codex providers on the server. See SERVER-DEPLOY.md.
+    local_override = inst / "config.local.yaml"
+    if local_override.exists():
+        for k, v in (load_yaml(local_override) or {}).items():
+            cfg[k] = v
+
     # config.yaml lives OUTSIDE the writable data volume and is mounted read-only
     # into the container — the agent cannot rewrite it.
     (inst / "config.yaml").write_text(

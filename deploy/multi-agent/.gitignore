@@ -5,6 +5,7 @@ docker-compose.generated.yml
 instances/*/.env
 instances/*/memory.env
 instances/*/config.yaml
+instances/*/config.local.yaml
 instances/*/data/
 instances/*/secrets/
 __pycache__/
