@@ -10,6 +10,7 @@ Tools (toolset youtrack):
   yt_get_comments  — get comments for an issue
   yt_create_issue  — create an issue (unassigned) with an ai_auto tag
   yt_add_comment   — add a comment with the #ai-auto marker
+  yt_work_items    — read logged time (spent time) aggregated per user
 """
 
 from __future__ import annotations
@@ -23,12 +24,14 @@ from .youtrack import (
     YT_GET_COMMENTS_SCHEMA,
     YT_CREATE_ISSUE_SCHEMA,
     YT_ADD_COMMENT_SCHEMA,
+    YT_WORK_ITEMS_SCHEMA,
     handle_yt_search,
     handle_yt_get_issue,
     handle_yt_list_projects,
     handle_yt_get_comments,
     handle_yt_create_issue,
     handle_yt_add_comment,
+    handle_yt_work_items,
     check_youtrack_deps,
 )
 
@@ -41,6 +44,7 @@ _TOOLS = (
     ("yt_get_comments",  YT_GET_COMMENTS_SCHEMA,  handle_yt_get_comments,  "💬"),
     ("yt_create_issue",  YT_CREATE_ISSUE_SCHEMA,  handle_yt_create_issue,  "✨"),
     ("yt_add_comment",   YT_ADD_COMMENT_SCHEMA,   handle_yt_add_comment,   "💭"),
+    ("yt_work_items",    YT_WORK_ITEMS_SCHEMA,    handle_yt_work_items,    "⏱️"),
 )
 
 

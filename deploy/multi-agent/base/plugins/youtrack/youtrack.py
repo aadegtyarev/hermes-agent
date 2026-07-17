@@ -8,6 +8,7 @@ Configuration via env vars:
 
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import urllib.parse
@@ -136,6 +137,12 @@ ISSUE_BRIEF_FIELDS = (
 
 COMMENT_FIELDS = "text,author(fullName,login),created,updated"
 PROJECT_FIELDS = "id,name,shortName,description"
+WORKITEM_FIELDS = (
+    "id,date,duration(minutes,presentation),"
+    "author(login,fullName),"
+    "text,type(name),"
+    "issue(idReadable,summary)"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -585,6 +592,197 @@ def handle_yt_add_comment(args, **_kw) -> str:
         "success": True,
         "issue_id": issue_id,
     })
+
+
+# ---------------------------------------------------------------------------
+# Work items (spent time) — READ-ONLY, aggregated per user
+# ---------------------------------------------------------------------------
+
+def _fmt_minutes(minutes: int) -> str:
+    """Human 'Xh Ym' for a raw minute total (clock hours, not workday-based)."""
+    minutes = int(minutes or 0)
+    h, m = divmod(minutes, 60)
+    if h and m:
+        return f"{h}h {m}m"
+    if h:
+        return f"{h}h"
+    return f"{m}m"
+
+
+def _wi_date_str(ms) -> str:
+    """Epoch-ms work-item date -> 'YYYY-MM-DD' (UTC)."""
+    try:
+        return datetime.datetime.utcfromtimestamp(int(ms) / 1000).strftime("%Y-%m-%d")
+    except (TypeError, ValueError, OSError):
+        return ""
+
+
+def _wi_author_matches(w: dict, needle_lower: str) -> bool:
+    a = w.get("author") or {}
+    return (
+        needle_lower in (a.get("login") or "").lower()
+        or needle_lower in (a.get("fullName") or "").lower()
+    )
+
+
+YT_WORK_ITEMS_SCHEMA = {
+    "name": "yt_work_items",
+    "description": (
+        "Read logged time (work items) and get spent time broken down PER USER. "
+        "Read-only. Two modes: (1) pass 'issue_id' for one ticket's time log; "
+        "(2) omit it and scope with 'project'/'query' and/or a 'start_date'..'end_date' "
+        "range to report across many tickets (e.g. who spent how much on a project "
+        "last month). Returns per-user totals (by_user), the grand total, and a "
+        "sample of individual entries. An unbounded fetch (no issue_id, no scope, "
+        "no dates) is refused."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "issue_id": {
+                "type": "string",
+                "description": "Single issue readable ID (e.g. 'FOO-123'); returns just that ticket's work items.",
+            },
+            "project": {
+                "type": "string",
+                "description": "Project short name to scope a cross-issue report (e.g. 'FOO').",
+            },
+            "query": {
+                "type": "string",
+                "description": "Raw YouTrack issue query to scope a cross-issue report (combined with 'project').",
+            },
+            "author": {
+                "type": "string",
+                "description": "Restrict to one user (login works best; full name also matched).",
+            },
+            "start_date": {
+                "type": "string",
+                "description": "Report period start, 'YYYY-MM-DD' (inclusive). Cross-issue mode only.",
+            },
+            "end_date": {
+                "type": "string",
+                "description": "Report period end, 'YYYY-MM-DD' (inclusive). Cross-issue mode only.",
+            },
+            "max_results": {
+                "type": "integer",
+                "description": "Max work items to fetch/aggregate (default 500, max 2000).",
+            },
+        },
+        "required": [],
+    },
+}
+
+_WI_ENTRIES_PREVIEW = 50
+
+
+def handle_yt_work_items(args, **_kw) -> str:
+    """Fetch work items (spent time) and aggregate per user. Read-only."""
+    issue_id = args.get("issue_id", "").strip()
+    query = args.get("query", "").strip()
+    project = args.get("project", "").strip()
+    author = args.get("author", "").strip()
+    start_date = args.get("start_date", "").strip()
+    end_date = args.get("end_date", "").strip()
+    max_results = min(int(args.get("max_results", 500) or 500), 2000)
+
+    if issue_id:
+        encoded_id = urllib.parse.quote(issue_id, safe="")
+        result = _get(
+            f"/issues/{encoded_id}/timeTracking/workItems",
+            params={"fields": WORKITEM_FIELDS, "$top": max_results},
+        )
+        scope = {"issue_id": issue_id}
+        if author:
+            scope["author"] = author
+    else:
+        q = query
+        if project:
+            q = (q + " " if q else "") + f"project: {{{project}}}"
+        q = q.strip()
+        if not q and not (start_date or end_date):
+            return _err(
+                "Provide 'issue_id', or scope a cross-issue report with "
+                "'project'/'query' and/or 'start_date'..'end_date'. "
+                "Refusing an unbounded work-items fetch."
+            )
+        params = {"fields": WORKITEM_FIELDS, "$top": max_results}
+        if q:
+            params["query"] = q
+        if start_date:
+            params["startDate"] = start_date
+        if end_date:
+            params["endDate"] = end_date
+        if author:
+            params["author"] = author
+        result = _get("/workItems", params=params)
+        scope = {
+            k: v
+            for k, v in {
+                "project": project,
+                "query": query,
+                "author": author,
+                "start_date": start_date,
+                "end_date": end_date,
+            }.items()
+            if v
+        }
+
+    if isinstance(result, dict) and "error" in result:
+        return _err(result["error"])
+    items = result if isinstance(result, list) else []
+
+    # Per-issue endpoint has no server-side author filter — apply it client-side.
+    if author and issue_id:
+        items = [w for w in items if _wi_author_matches(w, author.lower())]
+
+    by: dict = {}
+    total = 0
+    entries = []
+    for w in items:
+        dur = w.get("duration") or {}
+        mins = int(dur.get("minutes") or 0)
+        total += mins
+        a = w.get("author") or {}
+        key = a.get("login") or a.get("fullName") or "(unknown)"
+        b = by.setdefault(
+            key,
+            {"author": a.get("fullName") or key, "login": a.get("login") or "", "minutes": 0, "entries": 0},
+        )
+        b["minutes"] += mins
+        b["entries"] += 1
+        iss = w.get("issue") or {}
+        entries.append(
+            {
+                "issue": iss.get("idReadable", issue_id),
+                "date": _wi_date_str(w.get("date")),
+                "author": a.get("fullName") or a.get("login") or "(unknown)",
+                "minutes": mins,
+                "duration": (dur.get("presentation") or _fmt_minutes(mins)),
+                "type": (w.get("type") or {}).get("name", ""),
+                "text": (w.get("text") or "")[:200],
+            }
+        )
+
+    by_user = sorted(by.values(), key=lambda x: -x["minutes"])
+    for b in by_user:
+        b["duration"] = _fmt_minutes(b["minutes"])
+
+    return _json(
+        {
+            "success": True,
+            "scope": scope,
+            "count": len(items),
+            "total_minutes": total,
+            "total": _fmt_minutes(total),
+            "by_user": by_user,
+            "entries": entries[:_WI_ENTRIES_PREVIEW],
+            "entries_truncated": len(entries) > _WI_ENTRIES_PREVIEW,
+            "note": (
+                "Durations are clock h/m summed from minutes, not workday-based. "
+                "count is capped by max_results; raise it if truncated."
+            ),
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
