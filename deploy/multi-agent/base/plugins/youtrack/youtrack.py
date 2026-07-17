@@ -630,6 +630,22 @@ def _wi_author_matches(w: dict, needle_lower: str) -> bool:
     )
 
 
+def _wi_in_range(w: dict, start: str, end: str) -> bool:
+    """Keep a work item whose date falls in [start, end] ('YYYY-MM-DD', ISO-sortable).
+
+    Used for the single-ticket endpoint, which has no server-side date filter.
+    Undated items are dropped when any bound is set.
+    """
+    d = _wi_date_str(w.get("date"))
+    if not d:
+        return not (start or end)
+    if start and d < start:
+        return False
+    if end and d > end:
+        return False
+    return True
+
+
 def _fetch_all_workitems(path: str, params: dict, ceiling: int):
     """Auto-page a work-items endpoint until exhausted or *ceiling* reached.
 
@@ -687,7 +703,8 @@ YT_WORK_ITEMS_SCHEMA = {
         "Read logged time (work items / spent time) and get it broken down BY USER "
         "and BY TICKET. Read-only, auto-paged (fetches everything in the scope, no "
         "manual paging). Pick ONE scope:\n"
-        "  • issue_id='FOO-123' — time logged on that single ticket.\n"
+        "  • issue_id='FOO-123' — time logged on that single ticket (by_user then "
+        "answers 'who spent how much on it'); add start_date/end_date to limit to a period.\n"
         "  • subtasks_of='FOO-123' — time per SUBTASK of that ticket (plus the "
         "parent's own time); subtasks with no logged time are listed as 0.\n"
         "  • project='FOO' and/or query=<YouTrack issue query>, optionally with a "
@@ -722,11 +739,11 @@ YT_WORK_ITEMS_SCHEMA = {
             },
             "start_date": {
                 "type": "string",
-                "description": "Period start 'YYYY-MM-DD' (inclusive). Applies to subtasks_of and cross-ticket scopes.",
+                "description": "Period start 'YYYY-MM-DD' (inclusive). Applies to every scope, including a single issue_id.",
             },
             "end_date": {
                 "type": "string",
-                "description": "Period end 'YYYY-MM-DD' (inclusive). Applies to subtasks_of and cross-ticket scopes.",
+                "description": "Period end 'YYYY-MM-DD' (inclusive). Applies to every scope, including a single issue_id.",
             },
             "max_results": {
                 "type": "integer",
@@ -760,11 +777,15 @@ def handle_yt_work_items(args, **_kw) -> str:
     if issue_id:
         path = f"/issues/{urllib.parse.quote(issue_id, safe='')}/timeTracking/workItems"
         params = {"fields": WORKITEM_FIELDS}
-        # this endpoint has no server-side author filter
+        # this endpoint has no server-side author or date filter — apply both client-side
         client_author_filter = bool(author)
         scope = {"issue_id": issue_id}
         if author:
             scope["author"] = author
+        if start_date:
+            scope["start_date"] = start_date
+        if end_date:
+            scope["end_date"] = end_date
     elif subtasks_of:
         info = _subtasks_of(subtasks_of)
         if isinstance(info, dict) and "error" in info:
@@ -821,6 +842,9 @@ def handle_yt_work_items(args, **_kw) -> str:
 
     if client_author_filter:
         items = [w for w in items if _wi_author_matches(w, author.lower())]
+    # single-ticket endpoint can't filter by date server-side — do it here
+    if issue_id and (start_date or end_date):
+        items = [w for w in items if _wi_in_range(w, start_date, end_date)]
 
     by_user: dict = {}
     by_issue: dict = {
