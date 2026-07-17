@@ -1,7 +1,8 @@
 """Google Docs tools — READ-ONLY.
 
   * ``gdoc_read``     — read a Google Doc's text by URL or bare document id via
-    the Docs API (documents.readonly).
+    the Docs API (documents.readonly). Tab-aware: multi-tab documents are read
+    in full (every tab + nested child tabs), each tab prefixed with a header.
   * ``gdrive_search`` — full-text search across the user's Drive (content +
     name), returning matching files' id/name/link (drive.readonly). Results are
     cached with a short TTL. No create/update/delete surface exists.
@@ -41,10 +42,10 @@ def _parse_doc_id(ref: str) -> str:
     return ""
 
 
-def _text_from_body(doc: dict) -> str:
-    """Flatten the Docs structural content to plain text."""
+def _text_from_body(body: dict) -> str:
+    """Flatten a Docs ``body`` (``{content: [...]}``) to plain text."""
     out = []
-    for el in (doc.get("body", {}).get("content", []) or []):
+    for el in (body.get("content", []) or []):
         para = el.get("paragraph")
         if not para:
             # tables/other structural elements are skipped for a plain-text read
@@ -56,11 +57,65 @@ def _text_from_body(doc: dict) -> str:
     return "".join(out)
 
 
+def _flatten_tabs(tabs: list, depth: int = 0, out: list | None = None) -> list:
+    """Walk the tab tree (depth-first, incl. childTabs) into flat records.
+
+    Each record is ``{title, text, level}``. Tabs preserve their on-screen
+    order; nested child tabs follow their parent with an increased ``level``.
+    """
+    if out is None:
+        out = []
+    for tab in tabs or []:
+        props = tab.get("tabProperties", {}) or {}
+        body = (tab.get("documentTab", {}) or {}).get("body", {}) or {}
+        out.append(
+            {
+                "title": props.get("title", ""),
+                "text": _text_from_body(body),
+                "level": depth,
+            }
+        )
+        child = tab.get("childTabs")
+        if child:
+            _flatten_tabs(child, depth + 1, out)
+    return out
+
+
+def _text_from_doc(doc: dict) -> tuple[str, list]:
+    """Return (combined_text, tabs) for a document.
+
+    Tab-aware: for a genuine multi-tab document (Docs' tabs feature) each tab's
+    body is flattened and prefixed with a ``# <title>`` header so the plain
+    text stays readable; nested tabs are indented by header level. A document
+    with a single (default) tab, or a legacy single-body document, returns just
+    its plain text with no headers and no tabs list — so the common case is
+    unchanged.
+
+    Note: with ``includeTabsContent=True`` the Docs API returns content under
+    ``tabs`` for every document (one default tab even when the user never added
+    any), leaving the top-level ``body`` empty — hence the single-tab shortcut.
+    """
+    tabs = _flatten_tabs(doc.get("tabs"))
+    if not tabs:
+        return _text_from_body(doc.get("body", {}) or {}), []
+    if len(tabs) == 1:
+        return tabs[0]["text"], []
+
+    parts = []
+    for t in tabs:
+        header = "#" * (t["level"] + 1)
+        title = t["title"] or "(untitled tab)"
+        parts.append(f"{header} {title}\n\n{t['text']}".rstrip())
+    return "\n\n".join(parts), tabs
+
+
 GDOC_READ_SCHEMA = {
     "name": "gdoc_read",
     "description": (
         "Read the plain text of a Google Doc by URL or document id. Read-only. "
-        "Returns the document title and its text content."
+        "Returns the document title and its text content. Multi-tab documents "
+        "are read in full: every tab (and nested child tab) is included, each "
+        "prefixed with a '# <tab title>' header, plus a 'tabs' list in the result."
     ),
     "parameters": {
         "type": "object",
@@ -83,16 +138,27 @@ def handle_gdoc_read(args: dict, **kw) -> str:
         )
     try:
         svc = _gauth.service("docs", "v1", SCOPES)
-        doc = svc.documents().get(documentId=doc_id).execute()
+        # includeTabsContent=True returns every tab's body (Docs' multi-tab
+        # feature); without it only the first tab is populated under `body`.
+        doc = (
+            svc.documents()
+            .get(documentId=doc_id, includeTabsContent=True)
+            .execute()
+        )
     except Exception as e:
         return tool_error(f"Failed to read Google Doc {doc_id}: {e}")
-    return tool_result(
-        {
-            "document_id": doc_id,
-            "title": doc.get("title", ""),
-            "text": _text_from_body(doc),
-        }
-    )
+    text, tabs = _text_from_doc(doc)
+    payload = {
+        "document_id": doc_id,
+        "title": doc.get("title", ""),
+        "text": text,
+    }
+    if tabs:
+        payload["tab_count"] = len(tabs)
+        payload["tabs"] = [
+            {"title": t["title"], "level": t["level"]} for t in tabs
+        ]
+    return tool_result(payload)
 
 
 # --------------------------------------------------------------------------- #
