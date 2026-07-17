@@ -1,11 +1,12 @@
 name: youtrack
 label: YouTrack
 kind: standalone
-version: 1.0.0
+version: 1.1.0
 description: >
   YouTrack integration — search issues, browse details, list projects,
-  read comments, create issues with #ai_auto tag, and add comments
-  with #ai-auto marker. Auth via permanent token (YOUTRACK_TOKEN env var).
+  read comments, create issues with #ai_auto tag, add comments
+  with #ai-auto marker, and read logged time (work items) aggregated per user.
+  Auth via permanent token (YOUTRACK_TOKEN env var).
   Uses YouTrack REST API directly via requests.
 author: adsrv
 platforms:
@@ -17,3 +18,4 @@ provides_tools:
   - yt_get_comments
   - yt_create_issue
   - yt_add_comment
+  - yt_work_items
