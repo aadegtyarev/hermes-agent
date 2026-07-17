@@ -595,8 +595,13 @@ def handle_yt_add_comment(args, **_kw) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Work items (spent time) — READ-ONLY, aggregated per user
+# Work items (spent time) — READ-ONLY; aggregated per user AND per ticket
 # ---------------------------------------------------------------------------
+
+_WI_PAGE = 200          # page size for auto-paging
+_WI_CEILING = 5000      # hard ceiling on total work items pulled in one call
+_WI_ENTRIES_PREVIEW = 50
+
 
 def _fmt_minutes(minutes: int) -> str:
     """Human 'Xh Ym' for a raw minute total (clock hours, not workday-based)."""
@@ -625,31 +630,108 @@ def _wi_author_matches(w: dict, needle_lower: str) -> bool:
     )
 
 
+def _wi_in_range(w: dict, start: str, end: str) -> bool:
+    """Keep a work item whose date falls in [start, end] ('YYYY-MM-DD', ISO-sortable).
+
+    Used for the single-ticket endpoint, which has no server-side date filter.
+    Undated items are dropped when any bound is set.
+    """
+    d = _wi_date_str(w.get("date"))
+    if not d:
+        return not (start or end)
+    if start and d < start:
+        return False
+    if end and d > end:
+        return False
+    return True
+
+
+def _fetch_all_workitems(path: str, params: dict, ceiling: int):
+    """Auto-page a work-items endpoint until exhausted or *ceiling* reached.
+
+    Returns a (items, truncated) tuple, or an error dict if a page failed.
+    """
+    items: list = []
+    skip = 0
+    while len(items) < ceiling:
+        page = dict(params)
+        page["$top"] = min(_WI_PAGE, ceiling - len(items))
+        page["$skip"] = skip
+        batch = _get(path, params=page)
+        if isinstance(batch, dict) and "error" in batch:
+            return batch
+        if not isinstance(batch, list):
+            break
+        items.extend(batch)
+        if len(batch) < page["$top"]:
+            return items, False
+        skip += len(batch)
+    return items, True  # hit the ceiling — more may exist
+
+
+def _subtasks_of(parent_id: str):
+    """Resolve a ticket's direct subtasks. Returns dict(parent, children) or error."""
+    encoded = urllib.parse.quote(parent_id, safe="")
+    res = _get(
+        f"/issues/{encoded}",
+        params={
+            "fields": "idReadable,summary,"
+            "links(direction,linkType(name,sourceToTarget),issues(idReadable,summary))"
+        },
+    )
+    if isinstance(res, dict) and "error" in res:
+        return res
+    children = []
+    for link in res.get("links") or []:
+        lt = link.get("linkType") or {}
+        name = (lt.get("name") or "").lower()
+        s2t = (lt.get("sourceToTarget") or "").lower()
+        # A parent points OUTWARD to its subtasks ("parent for" / "Subtask").
+        if link.get("direction") == "OUTWARD" and ("subtask" in name or "parent" in s2t):
+            for iss in link.get("issues") or []:
+                if iss.get("idReadable"):
+                    children.append({"id": iss["idReadable"], "summary": iss.get("summary", "")})
+    return {
+        "parent": {"id": res.get("idReadable", parent_id), "summary": res.get("summary", "")},
+        "children": children,
+    }
+
+
 YT_WORK_ITEMS_SCHEMA = {
     "name": "yt_work_items",
     "description": (
-        "Read logged time (work items) and get spent time broken down PER USER. "
-        "Read-only. Two modes: (1) pass 'issue_id' for one ticket's time log; "
-        "(2) omit it and scope with 'project'/'query' and/or a 'start_date'..'end_date' "
-        "range to report across many tickets (e.g. who spent how much on a project "
-        "last month). Returns per-user totals (by_user), the grand total, and a "
-        "sample of individual entries. An unbounded fetch (no issue_id, no scope, "
-        "no dates) is refused."
+        "Read logged time (work items / spent time) and get it broken down BY USER "
+        "and BY TICKET. Read-only, auto-paged (fetches everything in the scope, no "
+        "manual paging). Pick ONE scope:\n"
+        "  • issue_id='FOO-123' — time logged on that single ticket (by_user then "
+        "answers 'who spent how much on it'); add start_date/end_date to limit to a period.\n"
+        "  • subtasks_of='FOO-123' — time per SUBTASK of that ticket (plus the "
+        "parent's own time); subtasks with no logged time are listed as 0.\n"
+        "  • project='FOO' and/or query=<YouTrack issue query>, optionally with a "
+        "start_date..end_date range — a cross-ticket report (e.g. time per ticket "
+        "and per person on a project last month).\n"
+        "Always returns by_user (per person) and by_issue (per ticket), the grand "
+        "total, and a sample of raw entries. Optional author= filter. An unbounded "
+        "fetch (no issue_id, no subtasks_of, no project/query, no dates) is refused."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "issue_id": {
                 "type": "string",
-                "description": "Single issue readable ID (e.g. 'FOO-123'); returns just that ticket's work items.",
+                "description": "Single ticket's own time log, e.g. 'FOO-123'.",
+            },
+            "subtasks_of": {
+                "type": "string",
+                "description": "Parent ticket id, e.g. 'FOO-123' — reports time per subtask (and the parent).",
             },
             "project": {
                 "type": "string",
-                "description": "Project short name to scope a cross-issue report (e.g. 'FOO').",
+                "description": "Project short name to scope a cross-ticket report (e.g. 'FOO').",
             },
             "query": {
                 "type": "string",
-                "description": "Raw YouTrack issue query to scope a cross-issue report (combined with 'project').",
+                "description": "Raw YouTrack issue query to scope a cross-ticket report (combined with 'project').",
             },
             "author": {
                 "type": "string",
@@ -657,43 +739,69 @@ YT_WORK_ITEMS_SCHEMA = {
             },
             "start_date": {
                 "type": "string",
-                "description": "Report period start, 'YYYY-MM-DD' (inclusive). Cross-issue mode only.",
+                "description": "Period start 'YYYY-MM-DD' (inclusive). Applies to every scope, including a single issue_id.",
             },
             "end_date": {
                 "type": "string",
-                "description": "Report period end, 'YYYY-MM-DD' (inclusive). Cross-issue mode only.",
+                "description": "Period end 'YYYY-MM-DD' (inclusive). Applies to every scope, including a single issue_id.",
             },
             "max_results": {
                 "type": "integer",
-                "description": "Max work items to fetch/aggregate (default 500, max 2000).",
+                "description": f"Hard cap on work items pulled (default/max {_WI_CEILING}). Lower it to sample faster.",
             },
         },
         "required": [],
     },
 }
 
-_WI_ENTRIES_PREVIEW = 50
-
 
 def handle_yt_work_items(args, **_kw) -> str:
-    """Fetch work items (spent time) and aggregate per user. Read-only."""
+    """Fetch work items (spent time), auto-paged, aggregated per user AND per ticket."""
     issue_id = args.get("issue_id", "").strip()
+    subtasks_of = args.get("subtasks_of", "").strip()
     query = args.get("query", "").strip()
     project = args.get("project", "").strip()
     author = args.get("author", "").strip()
     start_date = args.get("start_date", "").strip()
     end_date = args.get("end_date", "").strip()
-    max_results = min(int(args.get("max_results", 500) or 500), 2000)
+    try:
+        ceiling = int(args.get("max_results") or _WI_CEILING)
+    except (TypeError, ValueError):
+        ceiling = _WI_CEILING
+    ceiling = max(1, min(ceiling, _WI_CEILING))
+
+    # issues seeded into by_issue at 0 min so complete sets (subtasks) show gaps
+    seeded_issues: dict = {}
+    client_author_filter = False
 
     if issue_id:
-        encoded_id = urllib.parse.quote(issue_id, safe="")
-        result = _get(
-            f"/issues/{encoded_id}/timeTracking/workItems",
-            params={"fields": WORKITEM_FIELDS, "$top": max_results},
-        )
+        path = f"/issues/{urllib.parse.quote(issue_id, safe='')}/timeTracking/workItems"
+        params = {"fields": WORKITEM_FIELDS}
+        # this endpoint has no server-side author or date filter — apply both client-side
+        client_author_filter = bool(author)
         scope = {"issue_id": issue_id}
         if author:
             scope["author"] = author
+        if start_date:
+            scope["start_date"] = start_date
+        if end_date:
+            scope["end_date"] = end_date
+    elif subtasks_of:
+        info = _subtasks_of(subtasks_of)
+        if isinstance(info, dict) and "error" in info:
+            return _err(info["error"])
+        parent, children = info["parent"], info["children"]
+        ids = [parent["id"]] + [c["id"] for c in children]
+        seeded_issues = {parent["id"]: parent["summary"], **{c["id"]: c["summary"] for c in children}}
+        path = "/workItems"
+        params = {"fields": WORKITEM_FIELDS, "query": "issue id: " + ", ".join(ids)}
+        if start_date:
+            params["startDate"] = start_date
+        if end_date:
+            params["endDate"] = end_date
+        if author:
+            params["author"] = author
+        scope = {"subtasks_of": parent["id"], "subtasks": len(children)}
     else:
         q = query
         if project:
@@ -701,11 +809,12 @@ def handle_yt_work_items(args, **_kw) -> str:
         q = q.strip()
         if not q and not (start_date or end_date):
             return _err(
-                "Provide 'issue_id', or scope a cross-issue report with "
-                "'project'/'query' and/or 'start_date'..'end_date'. "
+                "Provide 'issue_id', 'subtasks_of', or scope a cross-ticket report "
+                "with 'project'/'query' and/or 'start_date'..'end_date'. "
                 "Refusing an unbounded work-items fetch."
             )
-        params = {"fields": WORKITEM_FIELDS, "$top": max_results}
+        path = "/workItems"
+        params = {"fields": WORKITEM_FIELDS}
         if q:
             params["query"] = q
         if start_date:
@@ -714,7 +823,6 @@ def handle_yt_work_items(args, **_kw) -> str:
             params["endDate"] = end_date
         if author:
             params["author"] = author
-        result = _get("/workItems", params=params)
         scope = {
             k: v
             for k, v in {
@@ -727,15 +835,22 @@ def handle_yt_work_items(args, **_kw) -> str:
             if v
         }
 
-    if isinstance(result, dict) and "error" in result:
-        return _err(result["error"])
-    items = result if isinstance(result, list) else []
+    fetched = _fetch_all_workitems(path, params, ceiling)
+    if isinstance(fetched, dict) and "error" in fetched:
+        return _err(fetched["error"])
+    items, truncated = fetched
 
-    # Per-issue endpoint has no server-side author filter — apply it client-side.
-    if author and issue_id:
+    if client_author_filter:
         items = [w for w in items if _wi_author_matches(w, author.lower())]
+    # single-ticket endpoint can't filter by date server-side — do it here
+    if issue_id and (start_date or end_date):
+        items = [w for w in items if _wi_in_range(w, start_date, end_date)]
 
-    by: dict = {}
+    by_user: dict = {}
+    by_issue: dict = {
+        iid: {"issue": iid, "summary": summ, "minutes": 0, "entries": 0}
+        for iid, summ in seeded_issues.items()
+    }
     total = 0
     entries = []
     for w in items:
@@ -743,17 +858,25 @@ def handle_yt_work_items(args, **_kw) -> str:
         mins = int(dur.get("minutes") or 0)
         total += mins
         a = w.get("author") or {}
-        key = a.get("login") or a.get("fullName") or "(unknown)"
-        b = by.setdefault(
-            key,
-            {"author": a.get("fullName") or key, "login": a.get("login") or "", "minutes": 0, "entries": 0},
+        ukey = a.get("login") or a.get("fullName") or "(unknown)"
+        u = by_user.setdefault(
+            ukey,
+            {"author": a.get("fullName") or ukey, "login": a.get("login") or "", "minutes": 0, "entries": 0},
         )
-        b["minutes"] += mins
-        b["entries"] += 1
+        u["minutes"] += mins
+        u["entries"] += 1
         iss = w.get("issue") or {}
+        ikey = iss.get("idReadable") or issue_id or "(unknown)"
+        i = by_issue.setdefault(
+            ikey, {"issue": ikey, "summary": iss.get("summary", ""), "minutes": 0, "entries": 0}
+        )
+        if iss.get("summary") and not i.get("summary"):
+            i["summary"] = iss["summary"]
+        i["minutes"] += mins
+        i["entries"] += 1
         entries.append(
             {
-                "issue": iss.get("idReadable", issue_id),
+                "issue": ikey,
                 "date": _wi_date_str(w.get("date")),
                 "author": a.get("fullName") or a.get("login") or "(unknown)",
                 "minutes": mins,
@@ -763,23 +886,29 @@ def handle_yt_work_items(args, **_kw) -> str:
             }
         )
 
-    by_user = sorted(by.values(), key=lambda x: -x["minutes"])
-    for b in by_user:
-        b["duration"] = _fmt_minutes(b["minutes"])
+    users = sorted(by_user.values(), key=lambda x: -x["minutes"])
+    for u in users:
+        u["duration"] = _fmt_minutes(u["minutes"])
+    issues = sorted(by_issue.values(), key=lambda x: -x["minutes"])
+    for i in issues:
+        i["duration"] = _fmt_minutes(i["minutes"])
 
     return _json(
         {
             "success": True,
             "scope": scope,
             "count": len(items),
+            "truncated": truncated,
             "total_minutes": total,
             "total": _fmt_minutes(total),
-            "by_user": by_user,
+            "by_user": users,
+            "by_issue": issues,
             "entries": entries[:_WI_ENTRIES_PREVIEW],
             "entries_truncated": len(entries) > _WI_ENTRIES_PREVIEW,
             "note": (
-                "Durations are clock h/m summed from minutes, not workday-based. "
-                "count is capped by max_results; raise it if truncated."
+                "Durations are clock h/m summed from minutes (not workday-based). "
+                "Results are auto-paged; 'truncated' is true only if the "
+                f"{_WI_CEILING}-item ceiling was hit."
             ),
         }
     )
