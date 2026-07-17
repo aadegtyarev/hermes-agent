@@ -10,7 +10,7 @@ here is added to the upstream `plugins/` tree.
 | `curl-jina` | (web_extract) | — | read | lxml + httpx; `HTTPS_PROXY` optional |
 | `github` | `github` | issue_list/view/**create**, pr_list/view/**merge**, repo_search | **read+write** | `gh` CLI; `GITHUB_TOKEN` (repo scope) |
 | `youtrack` | `youtrack` | `youtrack_search`, `youtrack_read_issue` | **read-only** | httpx; `YOUTRACK_URL/TOKEN` |
-| `google-docs` | `google_docs` | `gdoc_read` | **read-only** | google-api; `GOOGLE_OAUTH_TOKEN` |
+| `google-docs` | `google_docs` | `gdoc_read`, `gdrive_search` | **read-only** | google-api; `GOOGLE_OAUTH_TOKEN` (`GOOGLE_DRIVE_CACHE_TTL` opt) |
 | `google-sheets` | `google_sheets` | `gsheet_list_sheets`, `gsheet_read` | **read-only** | google-api; `GOOGLE_OAUTH_TOKEN` |
 | `ssh` | `ssh` | run/read/list, start/poll/send/stop/sessions, keygen/copy_id | run | openssh + sshpass; `SSH_*` |
 | `archive` | `archive` | `archive_list/extract/create` | run | unar/lsar + stdlib |

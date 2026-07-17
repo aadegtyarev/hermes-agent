@@ -1,9 +1,10 @@
 name: google-docs
-version: 1.0.0
-description: "Google Docs integration — read a document's text by URL/id (READ-ONLY, documents.readonly scope). No write tools. Credentials mounted read-only, resolved parent-side."
+version: 1.1.0
+description: "Google Docs + Drive integration — read a document's text by URL/id and full-text search across Drive by content/name (READ-ONLY, documents.readonly + drive.readonly scopes). Drive search is TTL-cached (GOOGLE_DRIVE_CACHE_TTL, default 300s). No write tools. Credentials mounted read-only, resolved parent-side."
 author: multi-agent
 kind: standalone
 requires_env: []
 provides_tools:
   - gdoc_read
+  - gdrive_search
 provides_hooks: []
