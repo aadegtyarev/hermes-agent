@@ -604,14 +604,14 @@ _WI_ENTRIES_PREVIEW = 50
 
 
 def _fmt_minutes(minutes: int) -> str:
-    """Human 'Xh Ym' for a raw minute total (clock hours, not workday-based)."""
+    """Human 'Xч Yм' for a raw minute total (clock hours, not workday-based)."""
     minutes = int(minutes or 0)
     h, m = divmod(minutes, 60)
     if h and m:
-        return f"{h}h {m}m"
+        return f"{h}ч {m}м"
     if h:
-        return f"{h}h"
-    return f"{m}m"
+        return f"{h}ч"
+    return f"{m}м"
 
 
 def _wi_date_str(ms) -> str:
@@ -880,7 +880,7 @@ def handle_yt_work_items(args, **_kw) -> str:
                 "date": _wi_date_str(w.get("date")),
                 "author": a.get("fullName") or a.get("login") or "(unknown)",
                 "minutes": mins,
-                "duration": (dur.get("presentation") or _fmt_minutes(mins)),
+                "duration": _fmt_minutes(mins),
                 "type": (w.get("type") or {}).get("name", ""),
                 "text": (w.get("text") or "")[:200],
             }
@@ -906,7 +906,8 @@ def handle_yt_work_items(args, **_kw) -> str:
             "entries": entries[:_WI_ENTRIES_PREVIEW],
             "entries_truncated": len(entries) > _WI_ENTRIES_PREVIEW,
             "note": (
-                "Durations are clock h/m summed from minutes (not workday-based). "
+                "Durations shown as Russian ч/м (clock hours summed from minutes, "
+                "not workday-based); use total_minutes/minutes for math. "
                 "Results are auto-paged; 'truncated' is true only if the "
                 f"{_WI_CEILING}-item ceiling was hit."
             ),
