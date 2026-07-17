@@ -10,7 +10,7 @@ Tools (toolset youtrack):
   yt_get_comments  — get comments for an issue
   yt_create_issue  — create an issue (unassigned) with an ai_auto tag
   yt_add_comment   — add a comment with the #ai-auto marker
-  yt_work_items    — read logged time (spent time) aggregated per user
+  yt_work_items    — read logged time (spent time), auto-paged, per user & per ticket
 """
 
 from __future__ import annotations
