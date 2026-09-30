@@ -1,8 +1,13 @@
 # Generated + secret + runtime artifacts — never commit.
 render/
 docker-compose.generated.yml
-# real secrets (the *.example templates ARE committed as reference)
-instances/*/.env
+# real secrets (the *.example templates ARE committed as reference).
+# Broad .env* pattern + explicit un-ignore for the template: a stray manual
+# backup like ".env.bak-google" (a full copy of live secrets, made by hand
+# next to .env during a config change) is just as dangerous as .env itself
+# and was NOT covered by the old exact-name-only pattern.
+instances/*/.env*
+!instances/*/.env.example
 instances/*/memory.env
 instances/*/config.yaml
 instances/*/config.local.yaml
