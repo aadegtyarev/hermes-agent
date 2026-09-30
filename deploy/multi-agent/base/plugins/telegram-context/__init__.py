@@ -156,17 +156,61 @@ def _programs_for_user(uid: str) -> list[str]:
     return [p for p, chat in store.programs().items() if _user_is_member_of_chat(uid, chat)]
 
 
-def _send(chat_id: str, text: str) -> None:
-    """Send a plain-text reply via the Bot API (used to ack admin commands)."""
+def _send(chat_id: str, text: str, parse_mode: str | None = None) -> None:
+    """Send a reply via the Bot API (used to ack admin commands + escalations).
+
+    ``parse_mode="MarkdownV2"`` lets a caller compose a masked link
+    (``[title](url)``, see ``_md2_link``) — plain by default so every
+    existing ack call is unaffected.
+    """
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     if not token or not chat_id:
         return
     try:
-        data = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode()
+        payload = {"chat_id": chat_id, "text": text}
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+        data = urllib.parse.urlencode(payload).encode()
         urllib.request.urlopen(
             f"https://api.telegram.org/bot{token}/sendMessage", data=data, timeout=8)
     except Exception as e:  # noqa: BLE001
         logger.warning("telegram-context sendMessage failed: %s", e)
+
+
+_MD2_SPECIAL_RE = re.compile(r"([_*\[\]()~`>#+\-=|{}.!\\])")
+
+
+def _md2_escape(text: str) -> str:
+    """Escape MarkdownV2 special characters in plain text (Telegram Bot API)."""
+    return _MD2_SPECIAL_RE.sub(r"\\\1", text or "")
+
+
+def _md2_link(display: str, url: str | None) -> str:
+    """A MarkdownV2 masked link (display text hides the URL), or just the
+    escaped display text when no URL is available (e.g. a chat we can't
+    build a deep link for)."""
+    safe_display = _md2_escape(display or "")
+    if not url:
+        return safe_display
+    # Only the closing paren and backslash need escaping inside a link URL
+    # (MarkdownV2 spec) — not the general text-escape set above.
+    safe_url = url.replace("\\", "\\\\").replace(")", "\\)")
+    return f"[{safe_display}]({safe_url})"
+
+
+def _telegram_chat_deep_link(chat_id: str, message_id: str | None = None) -> str | None:
+    """Best-effort ``https://t.me/c/<id>/<message_id>`` deep link for a private
+    supergroup/channel (the ``-100<id>`` numeric form — everything this plugin
+    deals with). Returns None for shapes this can't build a link for (basic
+    group chats have no stable public link at all); message_id defaults to 1
+    as a generic "open the chat" anchor when no specific message applies."""
+    cid = str(chat_id or "").strip()
+    if not cid.startswith("-100"):
+        return None
+    internal_id = cid[4:]
+    if not internal_id.isdigit():
+        return None
+    return f"https://t.me/c/{internal_id}/{message_id or 1}"
 
 
 _CHAT_COMMANDS = {"/hermes_here", "/hermes_readonly", "/hermes_forget", "/hermes_chats", "/hermes_program"}
@@ -468,30 +512,6 @@ def _parse_gdoc_id(ref: str) -> str:
     return ""
 
 
-def _origin_chat_id(session_id: str) -> str | None:
-    """Resolve the Telegram chat_id the CURRENT tool call's session belongs to.
-
-    ``pre_tool_call`` hooks get ``session_id`` (the real, already-persisted
-    core session id — ``agent.session_id``, set on every gateway turn), not
-    chat_id directly (model_tools.handle_function_call's dispatch signature
-    has no chat_id param at all). hermes-agent's own SessionDB already
-    records chat_id per session (gateway/session.py's build_session_key
-    scopes a group session on chat_id), so a cheap read-only lookup gets us
-    from one to the other without any new core plumbing. Returns None for a
-    CLI/non-gateway session, an unresolvable id, or on any lookup error —
-    fail-open to "can't tell", the callers below only restrict when this
-    resolves AND the resolved chat is registered as ``client`` mode.
-    """
-    if not session_id:
-        return None
-    try:
-        from hermes_state import SessionDB
-        row = SessionDB(read_only=True).get_session(session_id)
-        return str(row.get("chat_id") or "").strip() or None if row else None
-    except Exception:
-        return None
-
-
 def _pre_tool_call(tool_name=None, args=None, **kwargs):
     """Two independent hard guarantees, both keyed on chat mode, not on prompting:
 
@@ -532,7 +552,7 @@ def _pre_tool_call(tool_name=None, args=None, **kwargs):
        client chat's history (that cross-read is intentional — see the
        registry's module docstring).
 
-       Resolving "which chat is this session in" needs ``_origin_chat_id``
+       Resolving "which chat is this session in" needs ``store.origin_chat_id``
        (see its docstring) since chat_id isn't part of the hook's own
        kwargs — only checked for the specific tool names above, so every
        other tool call (the overwhelming majority) exits on the first line
@@ -550,7 +570,7 @@ def _pre_tool_call(tool_name=None, args=None, **kwargs):
                 "message": f"Chat {target_chat_id} is read-only — this bot never writes there. "
                            "Not something to work around; pick a different target or drop the send.",
             }
-        origin_chat = _origin_chat_id(kwargs.get("session_id") or "")
+        origin_chat = store.origin_chat_id(kwargs.get("session_id") or "")
         if origin_chat and store.chat_mode(origin_chat) == "client":
             if not target_chat_id or str(target_chat_id) != str(origin_chat):
                 return {
@@ -561,7 +581,7 @@ def _pre_tool_call(tool_name=None, args=None, **kwargs):
         return None
 
     if tool_name in _CROSS_CHAT_READ_TOOLS:
-        origin_chat = _origin_chat_id(kwargs.get("session_id") or "")
+        origin_chat = store.origin_chat_id(kwargs.get("session_id") or "")
         if origin_chat and store.chat_mode(origin_chat) == "client":
             requested = str((args or {}).get("chat_id") or "").strip()
             if requested != str(origin_chat):
@@ -573,7 +593,7 @@ def _pre_tool_call(tool_name=None, args=None, **kwargs):
         return None
 
     if tool_name == "session_search":
-        origin_chat = _origin_chat_id(kwargs.get("session_id") or "")
+        origin_chat = store.origin_chat_id(kwargs.get("session_id") or "")
         if origin_chat and store.chat_mode(origin_chat) == "client":
             return {
                 "action": "block",
@@ -583,7 +603,7 @@ def _pre_tool_call(tool_name=None, args=None, **kwargs):
         return None
 
     if tool_name == "gdrive_search":
-        origin_chat = _origin_chat_id(kwargs.get("session_id") or "")
+        origin_chat = store.origin_chat_id(kwargs.get("session_id") or "")
         if origin_chat and store.chat_mode(origin_chat) == "client":
             return {
                 "action": "block",
@@ -593,7 +613,7 @@ def _pre_tool_call(tool_name=None, args=None, **kwargs):
         return None
 
     if tool_name in ("gdoc_read", "gdoc_comments"):
-        origin_chat = _origin_chat_id(kwargs.get("session_id") or "")
+        origin_chat = store.origin_chat_id(kwargs.get("session_id") or "")
         if origin_chat and store.chat_mode(origin_chat) == "client":
             doc_id = _parse_gdoc_id(str((args or {}).get("url") or ""))
             if not doc_id or doc_id not in store.chat_doc_ids(origin_chat):

@@ -81,6 +81,24 @@ TELEGRAM_SEARCH = {"name": "telegram_search", "description": (
 TELEGRAM_DM_ALLOWLIST = {"name": "telegram_dm_allowlist", "description": "List users auto-collected into the DM allowlist (from work chats).",
     "parameters": {"type": "object", "properties": {}, "required": []}}
 
+ESCALATE_TO_TEAM_SCHEMA = {"name": "escalate_to_team", "description": (
+    "Bring in the human team responsible for this chat — posts to their own team "
+    "chat, never a private DM. Think of it like a capable junior colleague calling "
+    "over a senior: normal and expected when you're genuinely not confident in your "
+    "own answer, or the other person explicitly asks to talk to someone more "
+    "experienced. That is a good, professional call, not a failure — don't hold off "
+    "just because you already tried to help. Only usable inside an isolated client "
+    "chat; write 'message' the way you'd actually describe the situation to a "
+    "teammate walking in cold, not a fill-in-the-blanks template. Rate-limited per "
+    "chat — a repeat call too soon is reported back instead of sent again, so keep "
+    "helping conversationally until it clears."),
+    "parameters": {"type": "object", "properties": {
+        "message": {"type": "string", "description": "What's going on and why you're bringing the team in, in your own words."},
+        "message_id": {"type": "string", "description": "The specific message id this is about, if there is one clearly relevant — included as a link. Omit if nothing specific applies."},
+    }, "required": ["message"]}}
+
+_ESCALATION_COOLDOWN_SECONDS = 20 * 60
+
 
 def handle_telegram_thread(args, **kw):
     mid = str(args.get("message_id") or "").strip()
@@ -147,9 +165,48 @@ def handle_telegram_dm_allowlist(args, **kw):
     return tool_result({"count": len(users), "users": users})
 
 
+def handle_escalate_to_team(args, **kw):
+    # Lazy import: avoids a circular import at module-load time (__init__.py
+    # imports this module at its own top level).
+    from . import _md2_escape, _md2_link, _send, _telegram_chat_deep_link
+
+    session_id = str(kw.get("session_id") or "")
+    chat_id = store.origin_chat_id(session_id)
+    if not chat_id or store.chat_mode(chat_id) != "client":
+        return tool_error("escalate_to_team only works from inside an isolated client chat.")
+
+    program = store.chat_program(chat_id)
+    team_chat = store.program_chat_id(program) if program else None
+    if not team_chat:
+        return tool_error(f"Chat is registered under program {program!r}, which has no team chat on record.")
+
+    message = str(args.get("message") or "").strip()
+    if not message:
+        return tool_error("Pass 'message' — describe the situation in your own words.")
+
+    now = time.time()
+    last = store.last_escalation_ts(chat_id)
+    if last is not None and now - last < _ESCALATION_COOLDOWN_SECONDS:
+        wait = int(_ESCALATION_COOLDOWN_SECONDS - (now - last))
+        return tool_result({
+            "escalated": False, "reason": "cooldown", "retry_after_seconds": wait,
+            "hint": "Already escalated recently for this chat — keep helping conversationally instead of calling again.",
+        })
+
+    title = store.chat_title(chat_id) or chat_id
+    msg_id = str(args.get("message_id") or "").strip() or None
+    link = _telegram_chat_deep_link(chat_id, msg_id)
+    chat_ref = _md2_link(title, link)
+    text = f"Тебя зовут в чат {chat_ref}\\. {_md2_escape(message)}"
+    _send(team_chat, text, parse_mode="MarkdownV2")
+    store.record_escalation(chat_id, now)
+    return tool_result({"escalated": True, "team_chat": team_chat})
+
+
 TOOLS = (
     ("telegram_thread", TELEGRAM_THREAD, handle_telegram_thread, "🧵"),
     ("telegram_recent", TELEGRAM_RECENT, handle_telegram_recent, "🕘"),
     ("telegram_search", TELEGRAM_SEARCH, handle_telegram_search, "🔎"),
     ("telegram_dm_allowlist", TELEGRAM_DM_ALLOWLIST, handle_telegram_dm_allowlist, "👥"),
+    ("escalate_to_team", ESCALATE_TO_TEAM_SCHEMA, handle_escalate_to_team, "🆘"),
 )

@@ -152,6 +152,13 @@ def init() -> None:
                 chat_id TEXT, doc_id TEXT, first_seen_ts REAL, PRIMARY KEY(chat_id, doc_id))"""
         )
 
+        # Per-chat escalation cooldown (partner_escalate / the batch reviewer's
+        # own flag path share this — one clock per chat, not per caller).
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS chat_escalations(
+                chat_id TEXT PRIMARY KEY, last_escalated_ts REAL)"""
+        )
+
 
 def set_chat(chat_id: str, mode: str, title: str = "", added_by: str = "", program: str | None = None) -> None:
     import time
@@ -283,6 +290,69 @@ def chat_doc_ids(chat_id: str) -> set[str]:
     with _conn() as c:
         return {r["doc_id"] for r in c.execute(
             "SELECT doc_id FROM chat_doc_links WHERE chat_id=?", (str(chat_id),)).fetchall()}
+
+
+# ── Resolving which chat a tool call's session belongs to ───────────────────
+
+
+def origin_chat_id(session_id: str) -> str | None:
+    """Resolve the Telegram chat_id the CURRENT tool call's session belongs to.
+
+    ``pre_tool_call`` hooks and tool handlers alike get ``session_id`` (the
+    real, already-persisted core session id — ``agent.session_id``, set on
+    every gateway turn), not chat_id directly (neither
+    ``model_tools.handle_function_call``'s dispatch signature nor the tool
+    registry's own handler kwargs carry a chat_id param). hermes-agent's own
+    SessionDB already records chat_id per session (gateway/session.py's
+    build_session_key scopes a group session on chat_id), so a cheap
+    read-only lookup gets us from one to the other without any new core
+    plumbing. Returns None for a CLI/non-gateway session, an unresolvable id,
+    or on any lookup error — fail-open to "can't tell"; callers only restrict
+    when this resolves AND the resolved chat is registered as ``client`` mode.
+
+    Lives here (not in ``__init__.py``, where it originated) so both the
+    ``_pre_tool_call`` isolation guard AND ``tools.py``'s escalation handler
+    can use it without a circular import between the two.
+    """
+    if not session_id:
+        return None
+    try:
+        from hermes_state import SessionDB
+        row = SessionDB(read_only=True).get_session(session_id)
+        return str(row.get("chat_id") or "").strip() or None if row else None
+    except Exception:
+        return None
+
+
+# ── Escalation cooldown + chat metadata for the escalation tool ─────────────
+
+
+def chat_title(chat_id: str) -> str | None:
+    if not chat_id:
+        return None
+    with _conn() as c:
+        r = c.execute("SELECT title FROM chats_allowed WHERE chat_id=?", (str(chat_id),)).fetchone()
+        return (r["title"] or None) if r else None
+
+
+def last_escalation_ts(chat_id: str) -> float | None:
+    if not chat_id:
+        return None
+    with _conn() as c:
+        r = c.execute(
+            "SELECT last_escalated_ts FROM chat_escalations WHERE chat_id=?", (str(chat_id),)
+        ).fetchone()
+        return r["last_escalated_ts"] if r else None
+
+
+def record_escalation(chat_id: str, ts: float | None = None) -> None:
+    if not chat_id:
+        return
+    with _LOCK, _conn() as c:
+        c.execute(
+            "INSERT OR REPLACE INTO chat_escalations(chat_id,last_escalated_ts) VALUES(?,?)",
+            (str(chat_id), ts if ts is not None else time.time()),
+        )
 
 
 def add_dm_user(user_id: str, user_name: str = "", source_chat: str = "") -> None:
