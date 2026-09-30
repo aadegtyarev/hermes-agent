@@ -13456,7 +13456,7 @@ def main():
     # =========================================================================
     sessions_parser = subparsers.add_parser(
         "sessions",
-        help="Manage session history (list, rename, export, prune, delete)",
+        help="Manage session history (list, rename, export, digest, prune, delete)",
         description="View and manage the SQLite session store",
     )
     sessions_subparsers = sessions_parser.add_subparsers(dest="sessions_action")
@@ -13722,6 +13722,55 @@ def main():
     )
     sessions_browse.add_argument(
         "--limit", type=int, default=500, help="Max sessions to load (default: 500)"
+    )
+
+    sessions_digest = sessions_subparsers.add_parser(
+        "digest",
+        help="Page through a chat's message history within a time window "
+        "(for building topic reports over long histories)",
+    )
+    sessions_digest.add_argument(
+        "--chat-id", required=True, help="Chat/channel ID to pull messages for"
+    )
+    sessions_digest.add_argument(
+        "--source", default="telegram", help="Session source/platform (default: telegram)"
+    )
+    sessions_digest.add_argument(
+        "--thread-id", help="Restrict to one forum topic/thread ID"
+    )
+    sessions_digest.add_argument(
+        "--since", help="Start of window: duration ('7d', '26w'), bare number of "
+        "days, or an ISO timestamp"
+    )
+    sessions_digest.add_argument(
+        "--until", help="End of window (same formats as --since; default: now)"
+    )
+    sessions_digest.add_argument(
+        "--query", help="Case-insensitive substring filter over message content "
+        "(plain text, not FTS syntax) to narrow by topic"
+    )
+    sessions_digest.add_argument(
+        "--roles", default="user",
+        help="Comma-separated message roles to include (default: user)",
+    )
+    sessions_digest.add_argument(
+        "--cursor", type=int, default=0,
+        help="Resume after this message id (from a prior batch's next_cursor)",
+    )
+    sessions_digest.add_argument(
+        "--limit", type=int, default=300,
+        help="Max messages per batch (default 300, capped at 1000)",
+    )
+    sessions_digest.add_argument(
+        "--count-only", action="store_true",
+        help="Report total matching messages/time span/approx size only, no content",
+    )
+    sessions_digest.add_argument(
+        "--format", choices=["text", "jsonl"], default="text",
+        help="Output format (default: text)",
+    )
+    sessions_digest.add_argument(
+        "--output", help="Write to this file instead of stdout"
     )
 
     def _confirm_prompt(prompt: str) -> bool:
@@ -14420,6 +14469,84 @@ def main():
                 f"Database size: {before_mb:.1f} MB -> {after_mb:.1f} MB "
                 f"(reclaimed {saved:.1f} MB)"
             )
+
+        elif action == "digest":
+            from hermes_cli.session_filters import parse_point_in_time
+
+            since_ts = None
+            until_ts = None
+            try:
+                if args.since:
+                    since_ts = parse_point_in_time(args.since, "--since")
+                if args.until:
+                    until_ts = parse_point_in_time(args.until, "--until")
+            except ValueError as e:
+                print(f"Error: {e}")
+                db.close()
+                return
+            if since_ts is not None and until_ts is not None and since_ts >= until_ts:
+                print("Error: --since must be earlier than --until.")
+                db.close()
+                return
+
+            roles = [r.strip() for r in args.roles.split(",") if r.strip()] or None
+
+            if args.count_only:
+                result = db.get_chat_digest_page(
+                    source=args.source,
+                    chat_id=args.chat_id,
+                    thread_id=args.thread_id,
+                    since_ts=since_ts,
+                    until_ts=until_ts,
+                    query=args.query,
+                    roles=roles,
+                    count_only=True,
+                )
+                print(_json.dumps(result, indent=2))
+                db.close()
+                return
+
+            limit = max(1, min(args.limit, 1000))
+            page = db.get_chat_digest_page(
+                source=args.source,
+                chat_id=args.chat_id,
+                thread_id=args.thread_id,
+                since_ts=since_ts,
+                until_ts=until_ts,
+                query=args.query,
+                roles=roles,
+                after_id=args.cursor,
+                limit=limit,
+            )
+
+            meta = {
+                "matched_sessions": page["matched_sessions"],
+                "returned": page["returned"],
+                "has_more": page["has_more"],
+                "next_cursor": page["next_cursor"],
+            }
+            out_lines = []
+            if args.format == "jsonl":
+                for msg in page["messages"]:
+                    out_lines.append(_json.dumps(msg, ensure_ascii=False))
+                out_lines.append(_json.dumps({"_meta": meta}))
+            else:
+                for msg in page["messages"]:
+                    ts = datetime.fromtimestamp(msg["timestamp"]).strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    )
+                    tag = " (observed)" if msg["observed"] else ""
+                    out_lines.append(f"[{ts}]{tag} {msg['role']}")
+                    out_lines.append(str(msg["content"]))
+                    out_lines.append("---")
+                out_lines.append(f"=== META {_json.dumps(meta)} ===")
+
+            output_text = "\n".join(out_lines)
+            if args.output:
+                Path(args.output).write_text(output_text + "\n", encoding="utf-8")
+                print(f"Wrote {page['returned']} message(s) to {args.output}")
+            else:
+                print(output_text)
 
         elif action == "stats":
             total = db.session_count()
