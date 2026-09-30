@@ -342,12 +342,34 @@ def _handle_command(event, src, chat_id: str, uid: str):
     return _HANDLED
 
 
+_GDOC_LINK_RE = re.compile(r"https?://docs\.google\.com/document/d/([a-zA-Z0-9_-]+)")
+
+
+def _link_chat_docs(chat_id: str, text: str) -> None:
+    """Record any Google Docs links seen in a chat's own message text.
+
+    The ONLY source of truth for "which documents may gdoc_read touch from
+    this chat" (see the isolation guard in _pre_tool_call) — populated
+    incrementally as links are actually shared, never pre-registered at
+    chat-registration time (a client chat may share several documents over
+    its lifetime; which ones matter isn't known up front). Cheap and
+    unconditional: runs for every ingested message regardless of chat mode,
+    since the data only matters when read back for a client-mode chat.
+    """
+    if not chat_id or not text:
+        return
+    for m in _GDOC_LINK_RE.finditer(text):
+        store.link_chat_doc(chat_id, m.group(1))
+
+
 def _ingest(event) -> None:
     src = getattr(event, "source", None)
     if src is None:
         return
+    chat_id = str(getattr(src, "chat_id", "") or "")
+    text = getattr(event, "text", "") or ""
     store.add({
-        "chat_id": str(getattr(src, "chat_id", "") or ""),
+        "chat_id": chat_id,
         "message_id": str(getattr(event, "message_id", "") or ""),
         "ts": time.time(),
         "user_id": str(getattr(src, "user_id", "") or ""),
@@ -355,10 +377,11 @@ def _ingest(event) -> None:
         "chat_type": getattr(src, "chat_type", "") or "",
         "chat_name": getattr(src, "chat_name", "") or "",
         "thread_id": str(getattr(src, "thread_id", "") or ""),
-        "text": getattr(event, "text", "") or "",
+        "text": text,
         "reply_to_message_id": str(getattr(event, "reply_to_message_id", "") or ""),
         "reply_to_author": getattr(event, "reply_to_author_name", "") or "",
     })
+    _link_chat_docs(chat_id, text)
 
 
 def _auto_approve_pairing(uid: str, user_name: str = "") -> None:
@@ -427,6 +450,22 @@ _TELEGRAM_TARGET_CHAT_RE = re.compile(r"^\s*telegram(?::(-?\d+))?(?::\d+)?\s*$",
 # Tools whose cross-chat reach must be cut off for a client-mode chat's own
 # session — see _pre_tool_call's docstring for why each one is here.
 _CROSS_CHAT_READ_TOOLS = {"telegram_search", "telegram_recent"}
+
+# Mirrors google-docs/tools.py's own _DOC_ID_RE — duplicated rather than
+# imported so this plugin's isolation guard has no hard dependency on the
+# google-docs plugin being installed/enabled, same precedent as the
+# send_message target regex above not importing tools/send_message_tool.py.
+_GDOC_ID_FROM_URL_RE = re.compile(r"/document/d/([a-zA-Z0-9_-]+)")
+
+
+def _parse_gdoc_id(ref: str) -> str:
+    ref = (ref or "").strip()
+    m = _GDOC_ID_FROM_URL_RE.search(ref)
+    if m:
+        return m.group(1)
+    if ref and "/" not in ref and " " not in ref:
+        return ref
+    return ""
 
 
 def _origin_chat_id(session_id: str) -> str | None:
@@ -541,6 +580,29 @@ def _pre_tool_call(tool_name=None, args=None, **kwargs):
                 "message": "session_search isn't available in this chat — it's an isolated "
                            "client chat with no cross-session access.",
             }
+        return None
+
+    if tool_name == "gdrive_search":
+        origin_chat = _origin_chat_id(kwargs.get("session_id") or "")
+        if origin_chat and store.chat_mode(origin_chat) == "client":
+            return {
+                "action": "block",
+                "message": "gdrive_search isn't available in this chat — only documents already "
+                           "shared here can be opened with gdoc_read; nothing can be searched for.",
+            }
+        return None
+
+    if tool_name in ("gdoc_read", "gdoc_comments"):
+        origin_chat = _origin_chat_id(kwargs.get("session_id") or "")
+        if origin_chat and store.chat_mode(origin_chat) == "client":
+            doc_id = _parse_gdoc_id(str((args or {}).get("url") or ""))
+            if not doc_id or doc_id not in store.chat_doc_ids(origin_chat):
+                return {
+                    "action": "block",
+                    "message": "This is an isolated client chat — gdoc_read/gdoc_comments only "
+                               "work for a document already shared in THIS chat's own history. "
+                               "That document hasn't appeared here.",
+                }
         return None
 
     return None

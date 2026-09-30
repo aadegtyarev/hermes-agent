@@ -42,8 +42,19 @@ def _parse_doc_id(ref: str) -> str:
     return ""
 
 
-def _text_from_body(body: dict) -> str:
-    """Flatten a Docs ``body`` (``{content: [...]}``) to plain text."""
+def _text_from_body(body: dict, mark_suggestions: bool = False) -> str:
+    """Flatten a Docs ``body`` (``{content: [...]}``) to plain text.
+
+    ``mark_suggestions``: when the document was fetched with
+    ``suggestionsViewMode=SUGGESTIONS_INLINE`` (see ``handle_gdoc_read``'s
+    ``include_suggestions`` param), each text run MAY carry
+    ``suggestedInsertionIds``/``suggestedDeletionIds`` — Suggesting-mode
+    proposals that haven't been accepted/rejected yet. Wrap those runs in
+    ``⟪+...⟫``/``⟪-...⟫`` so a plain-text read doesn't silently present a
+    pending suggestion as already-accepted content. The Docs API does not
+    expose WHO made a suggestion here (unlike comments, where the author is
+    directly available) — only that the range is suggested and which kind.
+    """
     out = []
     for el in (body.get("content", []) or []):
         para = el.get("paragraph")
@@ -52,12 +63,20 @@ def _text_from_body(body: dict) -> str:
             continue
         for pe in para.get("elements", []) or []:
             run = pe.get("textRun")
-            if run and run.get("content"):
-                out.append(run["content"])
+            if not run or not run.get("content"):
+                continue
+            content = run["content"]
+            if mark_suggestions:
+                if run.get("suggestedInsertionIds"):
+                    content = f"⟪+{content}⟫"
+                elif run.get("suggestedDeletionIds"):
+                    content = f"⟪-{content}⟫"
+            out.append(content)
     return "".join(out)
 
 
-def _flatten_tabs(tabs: list, depth: int = 0, out: list | None = None) -> list:
+def _flatten_tabs(tabs: list, depth: int = 0, out: list | None = None,
+                   mark_suggestions: bool = False) -> list:
     """Walk the tab tree (depth-first, incl. childTabs) into flat records.
 
     Each record is ``{title, text, level}``. Tabs preserve their on-screen
@@ -71,17 +90,17 @@ def _flatten_tabs(tabs: list, depth: int = 0, out: list | None = None) -> list:
         out.append(
             {
                 "title": props.get("title", ""),
-                "text": _text_from_body(body),
+                "text": _text_from_body(body, mark_suggestions=mark_suggestions),
                 "level": depth,
             }
         )
         child = tab.get("childTabs")
         if child:
-            _flatten_tabs(child, depth + 1, out)
+            _flatten_tabs(child, depth + 1, out, mark_suggestions=mark_suggestions)
     return out
 
 
-def _text_from_doc(doc: dict) -> tuple[str, list]:
+def _text_from_doc(doc: dict, mark_suggestions: bool = False) -> tuple[str, list]:
     """Return (combined_text, tabs) for a document.
 
     Tab-aware: for a genuine multi-tab document (Docs' tabs feature) each tab's
@@ -95,9 +114,9 @@ def _text_from_doc(doc: dict) -> tuple[str, list]:
     ``tabs`` for every document (one default tab even when the user never added
     any), leaving the top-level ``body`` empty — hence the single-tab shortcut.
     """
-    tabs = _flatten_tabs(doc.get("tabs"))
+    tabs = _flatten_tabs(doc.get("tabs"), mark_suggestions=mark_suggestions)
     if not tabs:
-        return _text_from_body(doc.get("body", {}) or {}), []
+        return _text_from_body(doc.get("body", {}) or {}, mark_suggestions=mark_suggestions), []
     if len(tabs) == 1:
         return tabs[0]["text"], []
 
@@ -115,7 +134,11 @@ GDOC_READ_SCHEMA = {
         "Read the plain text of a Google Doc by URL or document id. Read-only. "
         "Returns the document title and its text content. Multi-tab documents "
         "are read in full: every tab (and nested child tab) is included, each "
-        "prefixed with a '# <tab title>' header, plus a 'tabs' list in the result."
+        "prefixed with a '# <tab title>' header, plus a 'tabs' list in the result. "
+        "Pass include_suggestions=true to also see pending Suggesting-mode edits "
+        "(marked inline as ⟪+inserted⟫/⟪-deleted⟫, not yet accepted/rejected) — "
+        "without it, suggested text reads as if already accepted. Use gdoc_comments "
+        "for sidebar comment threads, which this does not include."
     ),
     "parameters": {
         "type": "object",
@@ -123,6 +146,10 @@ GDOC_READ_SCHEMA = {
             "url": {
                 "type": "string",
                 "description": "Google Docs URL (https://docs.google.com/document/d/<ID>/...) or a bare document id.",
+            },
+            "include_suggestions": {
+                "type": "boolean",
+                "description": "Mark pending Suggesting-mode insertions/deletions inline instead of reading as already-accepted text (default: false).",
             },
         },
         "required": ["url"],
@@ -136,18 +163,26 @@ def handle_gdoc_read(args: dict, **kw) -> str:
         return tool_error(
             "Pass 'url' as a Google Docs link (…/document/d/<ID>/…) or a bare document id."
         )
+    mark_suggestions = bool(args.get("include_suggestions"))
     try:
         svc = _gauth.service("docs", "v1", SCOPES)
         # includeTabsContent=True returns every tab's body (Docs' multi-tab
         # feature); without it only the first tab is populated under `body`.
+        # suggestionsViewMode=SUGGESTIONS_INLINE keeps pending suggestions in
+        # the response (with suggestedInsertionIds/suggestedDeletionIds on
+        # their text runs) instead of previewing as already-accepted/rejected.
         doc = (
             svc.documents()
-            .get(documentId=doc_id, includeTabsContent=True)
+            .get(
+                documentId=doc_id,
+                includeTabsContent=True,
+                suggestionsViewMode="SUGGESTIONS_INLINE",
+            )
             .execute()
         )
     except Exception as e:
         return tool_error(f"Failed to read Google Doc {doc_id}: {e}")
-    text, tabs = _text_from_doc(doc)
+    text, tabs = _text_from_doc(doc, mark_suggestions=mark_suggestions)
     payload = {
         "document_id": doc_id,
         "title": doc.get("title", ""),
@@ -334,3 +369,82 @@ def handle_gdrive_search(args: dict, **kw) -> str:
     )
     _cache_put(cache_key, out)
     return out
+
+
+# --------------------------------------------------------------------------- #
+# gdoc_comments — sidebar comment threads (Drive Comments API), read-only
+# --------------------------------------------------------------------------- #
+
+GDOC_COMMENTS_SCHEMA = {
+    "name": "gdoc_comments",
+    "description": (
+        "Read sidebar comment threads on a Google Doc — reviewer feedback that "
+        "gdoc_read's plain-text export never includes (comments are a separate "
+        "Drive feature, not part of the document body). Each comment includes "
+        "its author, the text it was attached to, and any reply thread. "
+        "Read-only. Use gdoc_read(include_suggestions=true) instead for "
+        "Suggesting-mode inline edits, which are a different mechanism."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "url": {
+                "type": "string",
+                "description": "Google Docs URL (https://docs.google.com/document/d/<ID>/...) or a bare document id.",
+            },
+            "include_resolved": {
+                "type": "boolean",
+                "description": "Include comment threads already marked resolved (default: false — only open ones).",
+            },
+        },
+        "required": ["url"],
+    },
+}
+
+
+def handle_gdoc_comments(args: dict, **kw) -> str:
+    doc_id = _parse_doc_id(str(args.get("url") or ""))
+    if not doc_id:
+        return tool_error(
+            "Pass 'url' as a Google Docs link (…/document/d/<ID>/…) or a bare document id."
+        )
+    include_resolved = bool(args.get("include_resolved"))
+    try:
+        svc = _gauth.service("drive", "v3", DRIVE_SCOPES)
+        resp = (
+            svc.comments()
+            .list(
+                fileId=doc_id,
+                fields=(
+                    "comments(id,content,author(displayName),createdTime,"
+                    "resolved,quotedFileContent(value),"
+                    "replies(content,author(displayName),createdTime))"
+                ),
+                includeDeleted=False,
+            )
+            .execute()
+        )
+    except Exception as e:
+        return tool_error(f"Failed to read comments for {doc_id}: {e}")
+
+    comments = []
+    for c in resp.get("comments", []) or []:
+        if c.get("resolved") and not include_resolved:
+            continue
+        comments.append({
+            "id": c.get("id", ""),
+            "author": (c.get("author") or {}).get("displayName", ""),
+            "created": c.get("createdTime", ""),
+            "resolved": bool(c.get("resolved")),
+            "quoted_text": (c.get("quotedFileContent") or {}).get("value", ""),
+            "text": c.get("content", ""),
+            "replies": [
+                {
+                    "author": (r.get("author") or {}).get("displayName", ""),
+                    "created": r.get("createdTime", ""),
+                    "text": r.get("content", ""),
+                }
+                for r in (c.get("replies") or [])
+            ],
+        })
+    return tool_result({"document_id": doc_id, "count": len(comments), "comments": comments})
