@@ -5,14 +5,6 @@ One `pre_gateway_dispatch` hook does four things for Telegram:
        TELEGRAM_WORK_CHATS      → bot responds here; posters auto-added to the DM allowlist.
        TELEGRAM_READONLY_CHATS  → ingested for context, but the bot never replies (observe-only).
        (unset work+readonly → allow everything, so setup isn't locked out.)
-     Every dispatched Telegram event also mirrors this plugin's live readonly set
-     (env ∪ the /hermes_readonly runtime store) into the core TelegramAdapter's
-     own `read_only_chats` — see `_sync_core_read_only()`. This gate above only
-     ever skipped *dispatch*; the core mirror additionally hard-blocks the
-     adapter's own send()/edit_message()/send_typing(), so a chat marked
-     read-only here can truly never receive anything from the bot through any
-     code path, not just this hook. Takes effect immediately (no restart) —
-     `/hermes_readonly` is live on the very next message.
   2. DM allowlist — a DM is answered only if the sender is allowlisted: a work-chat
      member (auto-collected + live getChatMember check) or TELEGRAM_DM_EXTRA_USERS.
      Members of the read-only public chat do NOT gain DM access.
@@ -28,6 +20,21 @@ One `pre_gateway_dispatch` hook does four things for Telegram:
      non-members here).
   4. Ingest — stores messages so telegram_thread/recent/search can read history the
      Bot API can't fetch.
+
+A separate `pre_tool_call` hook (`_pre_tool_call`) hard-blocks `send_message`
+tool calls whose target resolves to a read-only chat — the actual "never
+writes there" guarantee, independent of dispatch gating above (which only
+ever governs whether the agent gets a *turn* for an inbound message; it says
+nothing about the agent later, possibly prompt-injected from an entirely
+different conversation, choosing to `send_message` there explicitly). An
+earlier version tried to get this guarantee by mirroring this plugin's
+readonly set into the core adapter's own `read_only_chats` field (a
+send-level guard hermes-agent core offers for static `config.yaml` use) —
+that backfired: the core field ALSO gates dispatch, so once mirrored, read-only
+chats silently stopped reaching this plugin's `_on_dispatch` at all, including
+admin commands like `/hermes_forget` typed from inside that chat. Blocking at
+the tool-call boundary instead needs no core changes at all and leaves
+dispatch routing untouched — see `_pre_tool_call`'s docstring.
 
 A separate ``telegram_chat_member_left`` hook (fired by the core Telegram adapter
 on the legacy ``message.left_chat_member`` service field — works for any bot,
@@ -55,9 +62,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 import urllib.parse
 import urllib.request
+from pathlib import Path
+
+from hermes_constants import get_hermes_home
 
 from . import store, tools as T
 
@@ -165,7 +176,9 @@ def _handle_command(event, src, chat_id: str, uid: str):
     if cmd not in _CHAT_COMMANDS:
         return None
     if uid not in _admin_users():
-        _send(chat_id, "⛔ Управлять списком чатов может только оператор бота (TELEGRAM_ADMIN_USERS).")
+        # Silent ignore, no "⛔ not allowed" reply — a non-admin poking
+        # /hermes_* shouldn't get any acknowledgement that the command
+        # exists or was noticed at all.
         return {"action": "skip", "reason": "telegram chat command from non-admin"}
     title = getattr(src, "chat_name", "") or ""
     if cmd == "/hermes_here":
@@ -269,29 +282,49 @@ def _dm_allowed(uid: str) -> bool:
     return _live_member(uid)
 
 
-def _sync_core_read_only(gateway) -> None:
-    """Mirror this plugin's read-only chat list into the core adapter's hard
-    send-level guard (``telegram.read_only_chats`` / ``TelegramAdapter.
-    _telegram_read_only_chats()``).
+_TELEGRAM_TARGET_CHAT_RE = re.compile(r"^\s*telegram(?::(-?\d+))?(?::\d+)?\s*$", re.IGNORECASE)
 
-    ``/hermes_readonly`` only ever gated *dispatch* here — this hook returns
-    ``{"action": "skip"}`` before the agent runs a turn, but that never
-    reached the adapter's own ``send()``/``edit_message()``/``send_typing()``
-    guard, which is the actual defense against anything else (a stray code
-    path, a cron delivery, a bug in this hook) ever writing to that chat.
-    Pushing the plugin's live readonly set (env ∪ runtime store) into the
-    adapter's ``config.extra`` keeps the two in sync automatically — that
-    dict is read fresh on every adapter call, not cached, so this takes
-    effect immediately, no container restart needed.
+
+def _pre_tool_call(tool_name=None, args=None, **kwargs):
+    """Hard-block ``send_message`` tool calls aimed at a read-only chat.
+
+    This is the actual "never writes there, no matter what" guarantee —
+    ``pre_gateway_dispatch`` (the gate in ``_on_dispatch`` below) only ever
+    stops the agent from getting a *turn* for a message that arrived FROM a
+    read-only chat; it says nothing about the agent later choosing (or being
+    prompt-injected into choosing, from an entirely different, legitimate
+    conversation) to explicitly ``send_message`` there. ``send_message``'s
+    ``target`` is a documented, unambiguous ``"platform:chat_id[:thread_id]"``
+    string (tools/send_message_tool.py) — cheap and reliable to match here
+    without needing to touch core or duplicate the tool's own resolution
+    logic. Runs for every tool call regardless of platform; returns quickly
+    for anything that isn't ``send_message`` targeting Telegram.
+
+    An earlier version tried to get the same guarantee by mirroring this
+    plugin's readonly set into the core adapter's ``read_only_chats`` (a
+    send-level guard added in hermes-agent core for operators who configure
+    it via static ``config.yaml``, not through this plugin). That backfired:
+    the core adapter gates *dispatch* on the same field, so once mirrored, a
+    chat's messages stopped reaching this plugin's own ``_on_dispatch`` at
+    all — including admin commands like ``/hermes_forget`` issued from
+    inside that chat, which is exactly the kind of lockout a deployment-local
+    fix must not introduce. Blocking at the tool-call boundary instead needs
+    no core changes and doesn't touch dispatch routing at all.
     """
-    try:
-        from gateway.config import Platform
-        adapter = getattr(gateway, "adapters", {}).get(Platform.TELEGRAM)
-        if adapter is None or not hasattr(adapter, "config"):
-            return
-        adapter.config.extra["read_only_chats"] = sorted(_readonly_chats())
-    except Exception as e:  # noqa: BLE001
-        logger.warning("telegram-context: failed to sync core read_only_chats: %s", e)
+    if tool_name != "send_message":
+        return None
+    target = str((args or {}).get("target") or "").strip()
+    m = _TELEGRAM_TARGET_CHAT_RE.match(target)
+    if not m:
+        return None
+    chat_id = m.group(1) or os.environ.get("TELEGRAM_HOME_CHANNEL", "").strip()
+    if chat_id and chat_id in _readonly_chats():
+        return {
+            "action": "block",
+            "message": f"Chat {chat_id} is read-only — this bot never writes there. "
+                       "Not something to work around; pick a different target or drop the send.",
+        }
+    return None
 
 
 def _on_dispatch(event=None, gateway=None, session_store=None, **kwargs):
@@ -299,7 +332,6 @@ def _on_dispatch(event=None, gateway=None, session_store=None, **kwargs):
         src = getattr(event, "source", None)
         if src is None or "telegram" not in str(getattr(src, "platform", "")).lower():
             return None
-        _sync_core_read_only(gateway)
         _clear_group_command_menu()  # keep the group "/" menu blank (throttled)
         chat_id = str(getattr(src, "chat_id", "") or "")
         ctype = (getattr(src, "chat_type", "") or "").lower()
@@ -365,15 +397,59 @@ def _on_chat_member_left(chat_id=None, user_id=None, **kwargs) -> None:
         logger.warning("telegram-context: revoke failed for uid=%s: %s", uid, e)
 
 
+_BACKUP_JOB_NAME = "telegram-db-nightly-backup"
+_BACKUP_SCRIPT_FILENAME = "telegram_db_backup.py"
+
+
+def _ensure_backup_cron_job() -> None:
+    """Register the nightly telegram.db backup as a hermes cron job, once.
+
+    hermes's cron scheduler resolves ``script=`` paths under
+    ``$HERMES_HOME/scripts/`` (the writable data volume) — not under
+    ``/opt/allowed/plugins`` (:ro bundled-plugins mount, where this file
+    itself lives). So this copies the bundled script there on every plugin
+    load (keeps it in sync with this plugin's version across redeploys —
+    it's a system-managed file, never hand-edited) but only CREATES the cron
+    job entry the first time, so a redeploy/restart never double-registers
+    it or clobbers an operator's own edits to the job's schedule/enabled
+    state. The job only ever runs while this gateway process is up, same as
+    every other cron job — nothing extra needed for "only if the bot is
+    running".
+    """
+    try:
+        from cron import jobs as cron_jobs
+
+        src = Path(__file__).resolve().parent / _BACKUP_SCRIPT_FILENAME
+        dest = get_hermes_home() / "scripts" / _BACKUP_SCRIPT_FILENAME
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+
+        if any(j.get("name") == _BACKUP_JOB_NAME for j in cron_jobs.list_jobs(include_disabled=True)):
+            return
+
+        cron_jobs.create_job(
+            prompt=None,
+            schedule="0 3 * * *",
+            name=_BACKUP_JOB_NAME,
+            script=_BACKUP_SCRIPT_FILENAME,
+            no_agent=True,
+        )
+        logger.info("telegram-context: registered nightly telegram.db backup cron job")
+    except Exception as e:  # noqa: BLE001
+        logger.warning("telegram-context: failed to register backup cron job: %s", e)
+
+
 def register(ctx) -> None:
     try:
         store.init()
     except Exception as e:  # noqa: BLE001
         logger.warning("telegram-context store init failed: %s", e)
+    _ensure_backup_cron_job()
     for name, schema, handler, emoji in T.TOOLS:
         ctx.register_tool(name=name, toolset="telegram", schema=schema, handler=handler, emoji=emoji)
     ctx.register_hook("pre_gateway_dispatch", _on_dispatch)
     ctx.register_hook("telegram_chat_member_left", _on_chat_member_left)
+    ctx.register_hook("pre_tool_call", _pre_tool_call)
     # Surface the /hermes_* admin commands in Telegram's "/" menu. Handling stays
     # in the hook above (fires before auth); these registrations are for menu
     # visibility + gateway command recognition. Non-fatal if unsupported.
