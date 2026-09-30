@@ -1,16 +1,18 @@
 ---
 name: internet-archaeology
-description: Systematic investigation of abandoned, lost, or historically significant open-source projects from the 2000s era — finding surviving traces when primary sources are gone.
-triggers:
-  - user asks about an old open-source project that seems to have vanished
-  - user wants to recover history of a 1990s-2000s era project
-  - user provides a project name and description but can't find any current trace
-  - user asks "what happened to project X" and it predates GitHub migration
+description: "Investigate abandoned open-source projects from the 2000s."
 ---
 
 # Internet Archaeology — Investigating Lost Open-Source Projects
 
 Systematic methodology for recovering traces of abandoned open-source projects from the 1990s-2000s era, when SourceForge was the primary host, personal project sites were common, and many projects left no surviving code.
+
+## When to Use
+
+- User asks about an old open-source project that seems to have vanished.
+- User wants to recover the history of a 1990s-2000s era project.
+- User gives a project name and description but no current trace can be found.
+- User asks "what happened to project X" and it predates the GitHub migration.
 
 ## Methodology (ordered by likelihood of finding something)
 

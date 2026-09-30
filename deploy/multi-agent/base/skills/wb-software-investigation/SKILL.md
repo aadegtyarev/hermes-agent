@@ -1,9 +1,6 @@
 ---
 name: wb-software-investigation
-description: >
-  Универсальная процедура исследования поведения любого Wiren Board софта: узнать версии
-  в stable и testing, проверить код на GitHub, сравнить изменения между каналами.
-  Применимо к wb-mqtt-serial, wb-rules, wb-mqtt-homeui, wb-mqtt-dali и т.д.
+description: "Проверить поведение ПО WB: stable/testing, код GitHub."
 author: multi-agent
 ---
 

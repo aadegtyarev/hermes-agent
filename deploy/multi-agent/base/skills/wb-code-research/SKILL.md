@@ -1,6 +1,6 @@
 ---
 name: wb-code-research
-description: "Методика верификации утверждений о поведении ПО Wiren Board через исходный код на GitHub, с обязательной сверкой stable и testing релизов."
+description: "Проверить поведение ПО Wiren Board по коду GitHub."
 ---
 
 # wb-code-research

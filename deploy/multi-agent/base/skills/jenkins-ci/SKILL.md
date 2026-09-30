@@ -1,6 +1,6 @@
 ---
 name: jenkins-ci
-description: "Jenkins CI — Hermes integration, API patterns, authentication, and operations for job/build/log/trigger workflows."
+description: "Manage Jenkins CI jobs/builds/logs/triggers via API."
 version: 1.0.0
 author: Kern
 metadata:

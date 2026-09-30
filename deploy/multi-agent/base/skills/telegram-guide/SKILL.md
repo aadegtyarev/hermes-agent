@@ -1,6 +1,6 @@
 ---
 name: telegram-guide
-description: Как читать Telegram-треды/историю через telegram_* тулы и как устроен гейтинг чатов и DM (что бот видит и где отвечает).
+description: "Читать Telegram-историю/треды, гейтинг чатов и DM."
 version: 1.2.0
 author: multi-agent
 platforms: [linux]
