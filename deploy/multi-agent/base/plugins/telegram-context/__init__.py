@@ -751,14 +751,70 @@ def _ensure_backup_cron_job() -> None:
         logger.warning("telegram-context: failed to register backup cron job: %s", e)
 
 
+_BATCH_REVIEW_JOB_NAME = "client-chat-batch-review"
+_BATCH_REVIEW_SCRIPT_FILENAME = "client_chat_batch_review.py"
+_BATCH_REVIEW_TOOLSET = "telegram_batch_review"
+
+_BATCH_REVIEW_PROMPT = (
+    "Review the client chats listed in the script output above — each is a "
+    "chat that's been quiet (no team reply) and just became due for a check. "
+    "For any that genuinely need the team's attention (a real question, a "
+    "file/photo worth a look, a problem — not routine chatter), call "
+    "partner_flag_chats once with all of them. An empty/omitted call is "
+    "completely normal when nothing qualifies. After that, respond with "
+    "exactly \"[SILENT]\" — delivery already happened via the tool call, "
+    "there is nothing else to report."
+)
+
+
+def _ensure_batch_review_cron_job() -> None:
+    """Register the client-chat batch reviewer as a hermes cron job, once.
+
+    Mirrors _ensure_backup_cron_job's copy-script-every-load /
+    create-job-only-once pattern exactly. Unlike the backup job, this one
+    DOES invoke the agent (no_agent=False) — but the script's own due-chat
+    filtering (see client_chat_batch_review.py) means the overwhelming
+    majority of ticks produce empty stdout, and cron/scheduler.py already
+    skips the LLM call entirely for empty script output. enabled_toolsets
+    scopes this job's agent to ONLY partner_flag_chats — it never gets
+    telegram_search/send_message/etc., so it cannot do anything BUT flag
+    chats from what the script handed it.
+    """
+    try:
+        from cron import jobs as cron_jobs
+
+        src = Path(__file__).resolve().parent / _BATCH_REVIEW_SCRIPT_FILENAME
+        dest = get_hermes_home() / "scripts" / _BATCH_REVIEW_SCRIPT_FILENAME
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+
+        if any(j.get("name") == _BATCH_REVIEW_JOB_NAME for j in cron_jobs.list_jobs(include_disabled=True)):
+            return
+
+        cron_jobs.create_job(
+            prompt=_BATCH_REVIEW_PROMPT,
+            schedule="every 5m",
+            name=_BATCH_REVIEW_JOB_NAME,
+            script=_BATCH_REVIEW_SCRIPT_FILENAME,
+            enabled_toolsets=[_BATCH_REVIEW_TOOLSET],
+            deliver="local",
+        )
+        logger.info("telegram-context: registered client-chat batch-review cron job")
+    except Exception as e:  # noqa: BLE001
+        logger.warning("telegram-context: failed to register batch-review cron job: %s", e)
+
+
 def register(ctx) -> None:
     try:
         store.init()
     except Exception as e:  # noqa: BLE001
         logger.warning("telegram-context store init failed: %s", e)
     _ensure_backup_cron_job()
+    _ensure_batch_review_cron_job()
     for name, schema, handler, emoji in T.TOOLS:
         ctx.register_tool(name=name, toolset="telegram", schema=schema, handler=handler, emoji=emoji)
+    for name, schema, handler, emoji in T.BATCH_REVIEW_TOOLS:
+        ctx.register_tool(name=name, toolset=_BATCH_REVIEW_TOOLSET, schema=schema, handler=handler, emoji=emoji)
     ctx.register_hook("pre_gateway_dispatch", _on_dispatch)
     ctx.register_hook("telegram_chat_member_left", _on_chat_member_left)
     ctx.register_hook("pre_tool_call", _pre_tool_call)

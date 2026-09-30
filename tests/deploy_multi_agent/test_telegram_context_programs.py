@@ -68,6 +68,7 @@ def plugin(monkeypatch, tmp_path):
 
     tools_mod = types.ModuleType(f"{pkg_name}.tools")
     tools_mod.TOOLS = ()
+    tools_mod.BATCH_REVIEW_TOOLS = ()
     sys.modules[f"{pkg_name}.tools"] = tools_mod
 
     init_spec = importlib.util.spec_from_file_location(

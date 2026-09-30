@@ -61,6 +61,7 @@ def plugin(monkeypatch, tmp_path):
 
     tools_mod = types.ModuleType(f"{pkg_name}.tools")
     tools_mod.TOOLS = ()
+    tools_mod.BATCH_REVIEW_TOOLS = ()
     sys.modules[f"{pkg_name}.tools"] = tools_mod
 
     init_spec = importlib.util.spec_from_file_location(
@@ -241,26 +242,37 @@ def test_sync_core_read_only_was_removed(plugin):
     assert not hasattr(plugin, "_sync_core_read_only")
 
 
-def test_register_installs_the_pre_tool_call_hook(plugin):
-    calls = []
+def test_register_installs_the_pre_tool_call_hook(plugin, monkeypatch):
+    hook_calls = []
+    tool_calls = []
 
     class FakeCtx:
         def register_tool(self, **kw):
-            pass
+            tool_calls.append(kw)
 
         def register_hook(self, name, handler):
-            calls.append((name, handler))
+            hook_calls.append((name, handler))
 
         def register_command(self, **kw):
             pass
 
+    # This fixture stubs tools.py to an empty TOOLS/BATCH_REVIEW_TOOLS — swap
+    # in one fake entry for BATCH_REVIEW_TOOLS just for this test, so the
+    # toolset-wiring logic in register() itself is actually exercised here.
+    monkeypatch.setattr(plugin.T, "BATCH_REVIEW_TOOLS",
+                         (("partner_flag_chats", {"name": "partner_flag_chats"}, lambda a, **k: "{}", "🚩"),))
+
     plugin.register(FakeCtx())
 
-    hook_names = [name for name, _ in calls]
+    hook_names = [name for name, _ in hook_calls]
     assert "pre_tool_call" in hook_names
     assert "pre_gateway_dispatch" in hook_names
-    registered = dict(calls)
+    registered = dict(hook_calls)
     assert registered["pre_tool_call"] is plugin._pre_tool_call
+
+    batch_tool_calls = [c for c in tool_calls if c.get("name") == "partner_flag_chats"]
+    assert len(batch_tool_calls) == 1
+    assert batch_tool_calls[0]["toolset"] == plugin._BATCH_REVIEW_TOOLSET
 
 
 # ── Nightly backup cron job registration ────────────────────────────────────
@@ -287,6 +299,33 @@ def test_ensure_backup_cron_job_registers_once(plugin, tmp_path):
     plugin._ensure_backup_cron_job()
     still_one = [j for j in cron_jobs.list_jobs(include_disabled=True)
                  if j.get("name") == plugin._BACKUP_JOB_NAME]
+    assert len(still_one) == 1
+
+
+def test_ensure_batch_review_cron_job_registers_once_scoped_to_its_own_toolset(plugin, tmp_path):
+    pytest.importorskip("croniter")
+    from cron import jobs as cron_jobs
+
+    plugin._ensure_batch_review_cron_job()
+
+    registered = [j for j in cron_jobs.list_jobs(include_disabled=True)
+                  if j.get("name") == plugin._BATCH_REVIEW_JOB_NAME]
+    assert len(registered) == 1
+    job = registered[0]
+    assert job.get("script") == plugin._BATCH_REVIEW_SCRIPT_FILENAME
+    # Agent-invoking (unlike the backup job) but scoped to ONLY its own
+    # toolset — the whole point is this job's agent cannot do anything but
+    # call partner_flag_chats on what the script handed it.
+    assert not job.get("no_agent")
+    assert job.get("enabled_toolsets") == [plugin._BATCH_REVIEW_TOOLSET]
+
+    script_copy = tmp_path / "scripts" / plugin._BATCH_REVIEW_SCRIPT_FILENAME
+    assert script_copy.exists()
+    assert "_due_chats" in script_copy.read_text(encoding="utf-8")
+
+    plugin._ensure_batch_review_cron_job()
+    still_one = [j for j in cron_jobs.list_jobs(include_disabled=True)
+                 if j.get("name") == plugin._BATCH_REVIEW_JOB_NAME]
     assert len(still_one) == 1
 
 

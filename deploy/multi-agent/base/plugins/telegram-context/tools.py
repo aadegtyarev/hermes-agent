@@ -165,42 +165,97 @@ def handle_telegram_dm_allowlist(args, **kw):
     return tool_result({"count": len(users), "users": users})
 
 
-def handle_escalate_to_team(args, **kw):
+def _escalate_chat(chat_id: str, message: str, message_id: str | None = None) -> dict:
+    """Shared core of escalate_to_team and the batch reviewer's flag path:
+    resolve chat -> program -> team chat, apply the per-chat cooldown, and
+    send the formatted notification. Returns a plain dict (not a JSON string)
+    so callers can fold it into their own tool_result/tool_error shape.
+    """
     # Lazy import: avoids a circular import at module-load time (__init__.py
     # imports this module at its own top level).
     from . import _md2_escape, _md2_link, _send, _telegram_chat_deep_link
 
-    session_id = str(kw.get("session_id") or "")
-    chat_id = store.origin_chat_id(session_id)
     if not chat_id or store.chat_mode(chat_id) != "client":
-        return tool_error("escalate_to_team only works from inside an isolated client chat.")
+        return {"ok": False, "error": f"{chat_id} is not a registered client chat."}
 
     program = store.chat_program(chat_id)
     team_chat = store.program_chat_id(program) if program else None
     if not team_chat:
-        return tool_error(f"Chat is registered under program {program!r}, which has no team chat on record.")
+        return {"ok": False, "error": f"Chat is registered under program {program!r}, which has no team chat on record."}
 
-    message = str(args.get("message") or "").strip()
+    message = (message or "").strip()
     if not message:
-        return tool_error("Pass 'message' — describe the situation in your own words.")
+        return {"ok": False, "error": "No message given — describe the situation."}
 
     now = time.time()
     last = store.last_escalation_ts(chat_id)
     if last is not None and now - last < _ESCALATION_COOLDOWN_SECONDS:
         wait = int(_ESCALATION_COOLDOWN_SECONDS - (now - last))
-        return tool_result({
-            "escalated": False, "reason": "cooldown", "retry_after_seconds": wait,
-            "hint": "Already escalated recently for this chat — keep helping conversationally instead of calling again.",
-        })
+        return {"ok": True, "escalated": False, "reason": "cooldown", "retry_after_seconds": wait}
 
     title = store.chat_title(chat_id) or chat_id
-    msg_id = str(args.get("message_id") or "").strip() or None
-    link = _telegram_chat_deep_link(chat_id, msg_id)
+    link = _telegram_chat_deep_link(chat_id, message_id)
     chat_ref = _md2_link(title, link)
     text = f"Тебя зовут в чат {chat_ref}\\. {_md2_escape(message)}"
     _send(team_chat, text, parse_mode="MarkdownV2")
     store.record_escalation(chat_id, now)
-    return tool_result({"escalated": True, "team_chat": team_chat})
+    return {"ok": True, "escalated": True, "team_chat": team_chat}
+
+
+def handle_escalate_to_team(args, **kw):
+    session_id = str(kw.get("session_id") or "")
+    chat_id = store.origin_chat_id(session_id)
+    if not chat_id:
+        return tool_error("escalate_to_team only works from inside an isolated client chat.")
+
+    message = str(args.get("message") or "").strip()
+    msg_id = str(args.get("message_id") or "").strip() or None
+    result = _escalate_chat(chat_id, message, msg_id)
+    if not result.pop("ok"):
+        return tool_error(result["error"])
+    return tool_result(result)
+
+
+# --------------------------------------------------------------------------- #
+# partner_flag_chats — the batch reviewer's own tool. NOT in the `telegram`
+# toolset a normal chat turn gets: registered into a separate
+# `telegram_batch_review` toolset that only the batch-review cron job's
+# agent is given (see _ensure_batch_review_cron_job's enabled_toolsets).
+# --------------------------------------------------------------------------- #
+
+PARTNER_FLAG_CHATS_SCHEMA = {"name": "partner_flag_chats", "description": (
+    "Flag which of the reviewed client chats actually need the team's attention "
+    "right now, with a short reason each. Only flag chats from the script output "
+    "above — never invent a chat_id. Skip routine chatter ('спасибо', 'ок', small "
+    "talk); flag a real question, a file/photo that needs a look, a problem, or "
+    "anything a person would actually want to see. An empty list is a completely "
+    "normal, expected result when nothing needs attention this pass."),
+    "parameters": {"type": "object", "properties": {
+        "flags": {"type": "array", "items": {"type": "object", "properties": {
+            "chat_id": {"type": "string"},
+            "reason": {"type": "string", "description": "What's going on, in your own words — becomes the team notification text."},
+        }, "required": ["chat_id", "reason"]}},
+    }, "required": ["flags"]}}
+
+
+def handle_partner_flag_chats(args, **kw):
+    flags = args.get("flags")
+    if not isinstance(flags, list):
+        return tool_error("Pass 'flags' as a list of {chat_id, reason}.")
+
+    results = []
+    for entry in flags:
+        if not isinstance(entry, dict):
+            continue
+        chat_id = str(entry.get("chat_id") or "").strip()
+        reason = str(entry.get("reason") or "").strip()
+        if not chat_id or not reason:
+            results.append({"chat_id": chat_id, "ok": False, "error": "missing chat_id/reason"})
+            continue
+        outcome = _escalate_chat(chat_id, reason)
+        results.append({"chat_id": chat_id, **outcome})
+
+    return tool_result({"count": len(results), "results": results})
 
 
 TOOLS = (
@@ -209,4 +264,11 @@ TOOLS = (
     ("telegram_search", TELEGRAM_SEARCH, handle_telegram_search, "🔎"),
     ("telegram_dm_allowlist", TELEGRAM_DM_ALLOWLIST, handle_telegram_dm_allowlist, "👥"),
     ("escalate_to_team", ESCALATE_TO_TEAM_SCHEMA, handle_escalate_to_team, "🆘"),
+)
+
+# Registered into its own toolset (telegram_batch_review), NOT `telegram` —
+# only the batch-review cron job's agent is granted that toolset. See
+# __init__.py's register()/_ensure_batch_review_cron_job.
+BATCH_REVIEW_TOOLS = (
+    ("partner_flag_chats", PARTNER_FLAG_CHATS_SCHEMA, handle_partner_flag_chats, "🚩"),
 )

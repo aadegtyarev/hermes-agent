@@ -152,11 +152,21 @@ def init() -> None:
                 chat_id TEXT, doc_id TEXT, first_seen_ts REAL, PRIMARY KEY(chat_id, doc_id))"""
         )
 
-        # Per-chat escalation cooldown (partner_escalate / the batch reviewer's
+        # Per-chat escalation cooldown (escalate_to_team / the batch reviewer's
         # own flag path share this — one clock per chat, not per caller).
         c.execute(
             """CREATE TABLE IF NOT EXISTS chat_escalations(
                 chat_id TEXT PRIMARY KEY, last_escalated_ts REAL)"""
+        )
+
+        # Batch reviewer's per-chat "last checked" clock (client_chat_batch_
+        # review.py, a standalone cron script, also creates this defensively
+        # since it runs in its own subprocess — kept here too so `hermes
+        # sessions digest`-style introspection and tests see the full schema
+        # from a single store.init() call).
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS chat_review_state(
+                chat_id TEXT PRIMARY KEY, last_reviewed_ts REAL)"""
         )
 
 
