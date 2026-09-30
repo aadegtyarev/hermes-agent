@@ -140,6 +140,25 @@ def _post_view(p: dict, text_len: int) -> dict:
     }
 
 
+def _safe_download_filename(name: str | None, fallback: str) -> str:
+    """Return a filename safe to join under a fixed download directory.
+
+    ``name`` comes from the attachment link TEXT in a forum post's cooked
+    HTML (see ``_extract_attachments``) — attacker-controlled content from
+    any thread the agent is asked to read, not just the model's own tool
+    call. A crafted attachment name like ``../../../../home/x/.ssh/
+    authorized_keys`` would otherwise escape the intended download
+    directory via ``os.path.join`` + ``os.path.normpath`` (path traversal
+    -> arbitrary file write). ``os.path.basename`` strips any directory
+    components; a bare ``.``/``..`` (no separator, so basename leaves it
+    unchanged) or an empty result falls back to a safe generated name.
+    """
+    base = os.path.basename(name or "")
+    if not base or base in (".", ".."):
+        return fallback
+    return base
+
+
 def _home() -> str:
     try:
         from hermes_constants import get_hermes_home
@@ -461,15 +480,26 @@ def handle_discourse_get_attachments(args, **_kw) -> str:
         return _json({"success": True, "topic_id": topic_id, "count": len(items), "attachments": items})
 
     home = _home()
-    dest_dir = os.path.join(home, "data", "discourse_downloads", f"topic_{topic_id}")
+    # topic_id is model-supplied (not from forum content), but sanitize it too
+    # before it becomes a directory name component — cheap defense-in-depth.
+    safe_topic_id = re.sub(r"[^A-Za-z0-9_-]", "_", topic_id) or "unknown"
+    dest_dir = os.path.normpath(os.path.join(home, "data", "discourse_downloads", f"topic_{safe_topic_id}"))
     os.makedirs(dest_dir, exist_ok=True)
 
     downloaded = []
     sess = _session()
     for i, a in enumerate(items):
         url = a["url"]
-        fname = a.get("filename") or os.path.basename(url.split("?")[0]) or f"file_{i}"
+        fallback_name = f"file_{i}"
+        fname = _safe_download_filename(
+            a.get("filename") or os.path.basename(url.split("?")[0]), fallback_name
+        )
         dest = os.path.normpath(os.path.join(dest_dir, fname))
+        # Belt-and-suspenders: confirm the resolved path is actually still
+        # inside dest_dir before ever opening it for write.
+        if os.path.commonpath([dest, dest_dir]) != dest_dir:
+            fname = fallback_name
+            dest = os.path.normpath(os.path.join(dest_dir, fname))
         try:
             r = sess.get(url, timeout=30, stream=True)
             r.raise_for_status()

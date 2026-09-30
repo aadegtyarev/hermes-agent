@@ -14,8 +14,11 @@ opt in via plugins.enabled: [http-fetch].
 """
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
+import socket
+from urllib.parse import urljoin, urlparse
 
 from tools.registry import tool_error, tool_result
 
@@ -24,6 +27,54 @@ logger = logging.getLogger(__name__)
 _MAX_BYTES_CAP = 25 * 1024 * 1024        # hard ceiling regardless of max_bytes
 _DEFAULT_MAX_BYTES = 5 * 1024 * 1024
 _TEXT_INLINE_CAP = 200_000               # chars returned inline for text bodies
+_MAX_REDIRECTS = 5
+
+
+def _resolve_host_ips(hostname: str) -> list[str]:
+    try:
+        infos = socket.getaddrinfo(hostname, None)
+    except socket.gaierror:
+        return []
+    return list({info[4][0] for info in infos})
+
+
+def _is_public_ip(ip_str: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return False
+    return not (
+        ip.is_private or ip.is_loopback or ip.is_link_local
+        or ip.is_multicast or ip.is_reserved or ip.is_unspecified
+    )
+
+
+def _ssrf_guard(url: str) -> str | None:
+    """Return an error string if ``url`` resolves to a non-public address.
+
+    The docstring promises "public URLs" only — this enforces that at the
+    network layer (DNS resolution -> IP range check), not just by trusting
+    the scheme. Without it, the model (or a prompt-injected instruction
+    from fetched content) could reach cloud metadata endpoints
+    (169.254.169.254), localhost services, or other internal-only hosts
+    this deliberately parent-side, no-sandbox tool was never meant to
+    touch. Every hop of a redirect chain is re-checked by the caller for
+    the same reason — a redirect Location is just as attacker-influenced
+    as the original URL.
+    """
+    hostname = urlparse(url).hostname
+    if not hostname:
+        return "url has no hostname"
+    ips = _resolve_host_ips(hostname)
+    if not ips:
+        return f"could not resolve host {hostname!r}"
+    for ip_str in ips:
+        if not _is_public_ip(ip_str):
+            return (
+                f"refusing to fetch {hostname!r}: resolves to a non-public "
+                f"address ({ip_str}); http_fetch only reaches public internet hosts"
+            )
+    return None
 
 HTTP_FETCH_SCHEMA = {
     "name": "http_fetch",
@@ -94,14 +145,31 @@ def handle_http_fetch(args, **_kw):
         timeout = 30
     save_path = str(args.get("save_path") or "").strip()
 
-    try:
-        resp = requests.request(
-            method, url, headers=headers,
-            data=(data.encode("utf-8") if isinstance(data, str) else data),
-            timeout=timeout, stream=True, allow_redirects=True,
-        )
-    except Exception as e:  # noqa: BLE001
-        return tool_error(f"request failed: {e}")
+    # Manual redirect loop (allow_redirects=False + re-check each hop)
+    # instead of requests' allow_redirects=True: a redirect Location header
+    # is just as attacker-influenced as the original URL, so the SSRF guard
+    # must run again before every hop, not just once on the initial url.
+    current_url = url
+    for _hop in range(_MAX_REDIRECTS + 1):
+        guard_err = _ssrf_guard(current_url)
+        if guard_err:
+            return tool_error(guard_err)
+        try:
+            resp = requests.request(
+                method, current_url, headers=headers,
+                data=(data.encode("utf-8") if isinstance(data, str) else data),
+                timeout=timeout, stream=True, allow_redirects=False,
+            )
+        except Exception as e:  # noqa: BLE001
+            return tool_error(f"request failed: {e}")
+        location = resp.headers.get("Location") if resp.is_redirect else None
+        if not location:
+            break
+        next_url = urljoin(current_url, location)
+        resp.close()
+        current_url = next_url
+    else:
+        return tool_error(f"too many redirects (> {_MAX_REDIRECTS})")
 
     # Read the body with a hard byte cap so a huge response can't blow up memory.
     chunks, total, truncated = [], 0, False

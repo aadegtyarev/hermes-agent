@@ -77,6 +77,21 @@ def _key_path() -> str:
     return os.path.expanduser("~/.ssh/id_ed25519")
 
 
+def _ssh_env(password: str | None) -> dict[str, str] | None:
+    """Subprocess environment for the ssh/sshpass call.
+
+    The password is passed to sshpass via the SSHPASS env var (``sshpass
+    -e``) rather than ``sshpass -p <password>``. Argv is world-readable on
+    Linux via `ps`/`/proc/<pid>/cmdline` for the lifetime of the process;
+    the environment of another user's process is not (needs same UID or
+    root), so this keeps the password out of the one place any local user
+    could read it in plain text.
+    """
+    if not password:
+        return None
+    return {**os.environ, "SSHPASS": password}
+
+
 def _ssh_prefix(timeout: int, password: str | None, interactive: bool = False) -> list[str]:
     """ssh argv up to (not including) the target host."""
     opts = [
@@ -87,7 +102,7 @@ def _ssh_prefix(timeout: int, password: str | None, interactive: bool = False) -
     ]
     argv: list[str] = []
     if password:
-        argv += ["sshpass", "-p", password]          # non-interactive password
+        argv += ["sshpass", "-e"]                     # non-interactive password via SSHPASS env, not argv
     else:
         opts += ["-o", "BatchMode=yes"]              # key/no-prompt
         key = _key_path()
@@ -109,7 +124,7 @@ def _run(host: str, remote_cmd: str, timeout: int, password: str | None) -> str:
     argv = [*_ssh_prefix(timeout, password), _target(host), remote_cmd]
     try:
         r = subprocess.run(argv, capture_output=True, text=True,
-                           timeout=min(int(timeout), _MAX_TIMEOUT))
+                           timeout=min(int(timeout), _MAX_TIMEOUT), env=_ssh_env(password))
     except subprocess.TimeoutExpired:
         return tool_error(f"ssh to {host} timed out after {timeout}s")
     except FileNotFoundError as e:
@@ -264,7 +279,8 @@ def handle_ssh_put(args, **kw):
         return tool_error("ssh_put needs 'content' (text) or 'local_path' (a local file, binary ok).")
     argv = [*_ssh_prefix(30, _password(args)), _target(host), remote_cmd]
     try:
-        r = subprocess.run(argv, input=payload, capture_output=True, text=True, timeout=180)
+        r = subprocess.run(argv, input=payload, capture_output=True, text=True, timeout=180,
+                           env=_ssh_env(_password(args)))
     except subprocess.TimeoutExpired:
         return tool_error(f"ssh_put to {host} timed out")
     except FileNotFoundError as e:
@@ -306,7 +322,8 @@ def handle_ssh_start(args, **kw):
             _target(host), command]
     try:
         proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True, bufsize=1)
+                                stderr=subprocess.STDOUT, text=True, bufsize=1,
+                                env=_ssh_env(_password(args)))
     except FileNotFoundError as e:
         return tool_error(f"missing binary ({e.filename})")
     except Exception as e:  # noqa: BLE001
