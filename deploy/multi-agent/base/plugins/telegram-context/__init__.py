@@ -424,46 +424,125 @@ def _dm_allowed(uid: str) -> bool:
 
 _TELEGRAM_TARGET_CHAT_RE = re.compile(r"^\s*telegram(?::(-?\d+))?(?::\d+)?\s*$", re.IGNORECASE)
 
+# Tools whose cross-chat reach must be cut off for a client-mode chat's own
+# session — see _pre_tool_call's docstring for why each one is here.
+_CROSS_CHAT_READ_TOOLS = {"telegram_search", "telegram_recent"}
+
+
+def _origin_chat_id(session_id: str) -> str | None:
+    """Resolve the Telegram chat_id the CURRENT tool call's session belongs to.
+
+    ``pre_tool_call`` hooks get ``session_id`` (the real, already-persisted
+    core session id — ``agent.session_id``, set on every gateway turn), not
+    chat_id directly (model_tools.handle_function_call's dispatch signature
+    has no chat_id param at all). hermes-agent's own SessionDB already
+    records chat_id per session (gateway/session.py's build_session_key
+    scopes a group session on chat_id), so a cheap read-only lookup gets us
+    from one to the other without any new core plumbing. Returns None for a
+    CLI/non-gateway session, an unresolvable id, or on any lookup error —
+    fail-open to "can't tell", the callers below only restrict when this
+    resolves AND the resolved chat is registered as ``client`` mode.
+    """
+    if not session_id:
+        return None
+    try:
+        from hermes_state import SessionDB
+        row = SessionDB(read_only=True).get_session(session_id)
+        return str(row.get("chat_id") or "").strip() or None if row else None
+    except Exception:
+        return None
+
 
 def _pre_tool_call(tool_name=None, args=None, **kwargs):
-    """Hard-block ``send_message`` tool calls aimed at a read-only chat.
+    """Two independent hard guarantees, both keyed on chat mode, not on prompting:
 
-    This is the actual "never writes there, no matter what" guarantee —
-    ``pre_gateway_dispatch`` (the gate in ``_on_dispatch`` below) only ever
-    stops the agent from getting a *turn* for a message that arrived FROM a
-    read-only chat; it says nothing about the agent later choosing (or being
-    prompt-injected into choosing, from an entirely different, legitimate
-    conversation) to explicitly ``send_message`` there. ``send_message``'s
-    ``target`` is a documented, unambiguous ``"platform:chat_id[:thread_id]"``
-    string (tools/send_message_tool.py) — cheap and reliable to match here
-    without needing to touch core or duplicate the tool's own resolution
-    logic. Runs for every tool call regardless of platform; returns quickly
-    for anything that isn't ``send_message`` targeting Telegram.
+    1. ``send_message`` aimed at a read-only chat is blocked outright — the
+       actual "never writes there, no matter what" guarantee. ``pre_gateway_
+       dispatch`` (the gate in ``_on_dispatch`` below) only ever stops the
+       agent from getting a *turn* for a message that arrived FROM a
+       read-only chat; it says nothing about the agent later choosing (or
+       being prompt-injected into choosing, from an entirely different
+       conversation) to explicitly ``send_message`` there. ``send_message``'s
+       ``target`` is a documented, unambiguous ``"platform:chat_id[:thread_id]"``
+       string (tools/send_message_tool.py) — cheap and reliable to match here
+       without needing to touch core or duplicate the tool's own resolution
+       logic.
 
-    An earlier version tried to get the same guarantee by mirroring this
-    plugin's readonly set into the core adapter's ``read_only_chats`` (a
-    send-level guard added in hermes-agent core for operators who configure
-    it via static ``config.yaml``, not through this plugin). That backfired:
-    the core adapter gates *dispatch* on the same field, so once mirrored, a
-    chat's messages stopped reaching this plugin's own ``_on_dispatch`` at
-    all — including admin commands like ``/hermes_forget`` issued from
-    inside that chat, which is exactly the kind of lockout a deployment-local
-    fix must not introduce. Blocking at the tool-call boundary instead needs
-    no core changes and doesn't touch dispatch routing at all.
+       An earlier version tried to get this guarantee by mirroring this
+       plugin's readonly set into the core adapter's ``read_only_chats`` (a
+       send-level guard hermes-agent core offers for static ``config.yaml``
+       use) — that backfired: the core field ALSO gates dispatch, so once
+       mirrored, read-only chats silently stopped reaching this plugin's
+       ``_on_dispatch`` at all, including admin commands like
+       ``/hermes_forget`` typed from inside that chat. Blocking at the
+       tool-call boundary instead needs no core changes at all.
+
+    2. A **client-mode chat's own session** may never reach outside itself:
+       ``send_message`` may only target its OWN chat (the only legitimate way
+       out is a dedicated escalation tool, landing in a follow-up PR — not
+       ``send_message`` to an arbitrary chat_id); ``telegram_search``/
+       ``telegram_recent`` may only be scoped to its own chat_id (omitting
+       chat_id, or passing a different one, is blocked rather than silently
+       narrowed — a silent rewrite would hide the restriction from the model
+       instead of teaching it the right call); ``session_search`` is blocked
+       outright (it's a cross-session discovery tool with no per-chat scoping
+       at all — nothing a client-chat assistant legitimately needs). Work and
+       read-only chats are completely unaffected — this whole guarantee is
+       ONE-DIRECTIONAL: it isolates a client chat's own session from seeing
+       anything else, it does not stop a work-chat session from reading a
+       client chat's history (that cross-read is intentional — see the
+       registry's module docstring).
+
+       Resolving "which chat is this session in" needs ``_origin_chat_id``
+       (see its docstring) since chat_id isn't part of the hook's own
+       kwargs — only checked for the specific tool names above, so every
+       other tool call (the overwhelming majority) exits on the first line
+       below with no lookup at all.
     """
-    if tool_name != "send_message":
+    if tool_name == "send_message":
+        target = str((args or {}).get("target") or "").strip()
+        m = _TELEGRAM_TARGET_CHAT_RE.match(target)
+        if not m:
+            return None
+        target_chat_id = m.group(1) or os.environ.get("TELEGRAM_HOME_CHANNEL", "").strip()
+        if target_chat_id and target_chat_id in _readonly_chats():
+            return {
+                "action": "block",
+                "message": f"Chat {target_chat_id} is read-only — this bot never writes there. "
+                           "Not something to work around; pick a different target or drop the send.",
+            }
+        origin_chat = _origin_chat_id(kwargs.get("session_id") or "")
+        if origin_chat and store.chat_mode(origin_chat) == "client":
+            if not target_chat_id or str(target_chat_id) != str(origin_chat):
+                return {
+                    "action": "block",
+                    "message": "This is an isolated client chat — send_message may only target "
+                               "this same chat. There is no cross-chat messaging from here.",
+                }
         return None
-    target = str((args or {}).get("target") or "").strip()
-    m = _TELEGRAM_TARGET_CHAT_RE.match(target)
-    if not m:
+
+    if tool_name in _CROSS_CHAT_READ_TOOLS:
+        origin_chat = _origin_chat_id(kwargs.get("session_id") or "")
+        if origin_chat and store.chat_mode(origin_chat) == "client":
+            requested = str((args or {}).get("chat_id") or "").strip()
+            if requested != str(origin_chat):
+                return {
+                    "action": "block",
+                    "message": f"This is an isolated client chat — {tool_name} only works scoped "
+                               f"to its own history. Pass chat_id='{origin_chat}' explicitly.",
+                }
         return None
-    chat_id = m.group(1) or os.environ.get("TELEGRAM_HOME_CHANNEL", "").strip()
-    if chat_id and chat_id in _readonly_chats():
-        return {
-            "action": "block",
-            "message": f"Chat {chat_id} is read-only — this bot never writes there. "
-                       "Not something to work around; pick a different target or drop the send.",
-        }
+
+    if tool_name == "session_search":
+        origin_chat = _origin_chat_id(kwargs.get("session_id") or "")
+        if origin_chat and store.chat_mode(origin_chat) == "client":
+            return {
+                "action": "block",
+                "message": "session_search isn't available in this chat — it's an isolated "
+                           "client chat with no cross-session access.",
+            }
+        return None
+
     return None
 
 

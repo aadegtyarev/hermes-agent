@@ -288,3 +288,149 @@ def test_ensure_backup_cron_job_registers_once(plugin, tmp_path):
     still_one = [j for j in cron_jobs.list_jobs(include_disabled=True)
                  if j.get("name") == plugin._BACKUP_JOB_NAME]
     assert len(still_one) == 1
+
+
+# ── Client-chat isolation: telegram_search/telegram_recent/session_search/
+# send_message must all be pinned to (or blocked outside of) a client chat's
+# own history — the one-directional guarantee described in _pre_tool_call's
+# docstring. _origin_chat_id resolves session_id -> chat_id via hermes_state's
+# SessionDB, so these tests fake that class rather than standing up a real one.
+
+class _FakeSessionDB:
+    """Maps session_id -> chat_id for _origin_chat_id, set per test via _SESSIONS."""
+    _SESSIONS: dict[str, str] = {}
+
+    def __init__(self, read_only: bool = False):
+        pass
+
+    def get_session(self, session_id):
+        chat_id = self._SESSIONS.get(session_id)
+        return {"chat_id": chat_id} if chat_id is not None else None
+
+
+@pytest.fixture
+def fake_session_db(monkeypatch):
+    import hermes_state
+
+    _FakeSessionDB._SESSIONS = {}
+    monkeypatch.setattr(hermes_state, "SessionDB", _FakeSessionDB)
+    return _FakeSessionDB
+
+
+def _client_session(plugin, fake_session_db, session_id: str, chat_id: str, program: str = "journalist-partners"):
+    plugin.store.create_program(program, "-500", "111")
+    plugin.store.set_chat(chat_id, "client", "Acme", "111", program=program)
+    fake_session_db._SESSIONS[session_id] = chat_id
+
+
+def test_telegram_search_blocked_without_own_chat_id_from_client_chat(plugin, fake_session_db):
+    _client_session(plugin, fake_session_db, "sess-1", "-700")
+
+    result = plugin._pre_tool_call(
+        tool_name="telegram_search", args={"query": "hello"}, session_id="sess-1",
+    )
+
+    assert result is not None and result["action"] == "block"
+
+
+def test_telegram_search_blocked_for_a_different_chat_id_from_client_chat(plugin, fake_session_db):
+    _client_session(plugin, fake_session_db, "sess-1", "-700")
+
+    result = plugin._pre_tool_call(
+        tool_name="telegram_search", args={"query": "hello", "chat_id": "-999"}, session_id="sess-1",
+    )
+
+    assert result is not None and result["action"] == "block"
+
+
+def test_telegram_search_allowed_scoped_to_its_own_chat_id_from_client_chat(plugin, fake_session_db):
+    _client_session(plugin, fake_session_db, "sess-1", "-700")
+
+    result = plugin._pre_tool_call(
+        tool_name="telegram_search", args={"query": "hello", "chat_id": "-700"}, session_id="sess-1",
+    )
+
+    assert result is None
+
+
+def test_telegram_recent_default_chat_id_blocked_from_client_chat(plugin, fake_session_db):
+    """No chat_id at all (telegram_recent's usual 'default to latest active
+    chat' behavior) must NOT quietly fall through to another chat's data."""
+    _client_session(plugin, fake_session_db, "sess-1", "-700")
+
+    result = plugin._pre_tool_call(tool_name="telegram_recent", args={}, session_id="sess-1")
+
+    assert result is not None and result["action"] == "block"
+
+
+def test_session_search_fully_blocked_from_client_chat(plugin, fake_session_db):
+    _client_session(plugin, fake_session_db, "sess-1", "-700")
+
+    result = plugin._pre_tool_call(
+        tool_name="session_search", args={"query": "anything"}, session_id="sess-1",
+    )
+
+    assert result is not None and result["action"] == "block"
+
+
+def test_send_message_to_own_chat_allowed_from_client_chat(plugin, fake_session_db):
+    _client_session(plugin, fake_session_db, "sess-1", "-700")
+
+    result = plugin._pre_tool_call(
+        tool_name="send_message", args={"target": "telegram:-700", "message": "hi"}, session_id="sess-1",
+    )
+
+    assert result is None
+
+
+def test_send_message_to_a_different_chat_blocked_from_client_chat(plugin, fake_session_db):
+    _client_session(plugin, fake_session_db, "sess-1", "-700")
+
+    result = plugin._pre_tool_call(
+        tool_name="send_message", args={"target": "telegram:-999", "message": "hi"}, session_id="sess-1",
+    )
+
+    assert result is not None and result["action"] == "block"
+
+
+def test_send_message_bare_telegram_target_blocked_from_client_chat(plugin, fake_session_db, monkeypatch):
+    """Bare 'telegram' resolves against TELEGRAM_HOME_CHANNEL, which is never
+    the client chat itself — must not slip through as an implicit allow."""
+    monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "-999")
+    _client_session(plugin, fake_session_db, "sess-1", "-700")
+
+    result = plugin._pre_tool_call(
+        tool_name="send_message", args={"target": "telegram", "message": "hi"}, session_id="sess-1",
+    )
+
+    assert result is not None and result["action"] == "block"
+
+
+def test_isolation_guards_do_not_apply_to_work_chats(plugin, fake_session_db):
+    """Regression guard: the whole point is ONE-DIRECTIONAL isolation — a
+    session running in a WORK chat must keep unrestricted cross-chat read
+    access (deliberately allowed per the registry's own module docstring)."""
+    plugin.store.set_chat("-800", "work", "", "111")
+    fake_session_db._SESSIONS["sess-2"] = "-800"
+
+    assert plugin._pre_tool_call(
+        tool_name="telegram_search", args={"query": "hello"}, session_id="sess-2",
+    ) is None
+    assert plugin._pre_tool_call(
+        tool_name="session_search", args={"query": "anything"}, session_id="sess-2",
+    ) is None
+    assert plugin._pre_tool_call(
+        tool_name="send_message", args={"target": "telegram:-999"}, session_id="sess-2",
+    ) is None
+
+
+def test_isolation_guards_no_op_without_a_resolvable_session(plugin, fake_session_db):
+    """An unresolvable/missing session_id (e.g. a CLI call) must fail OPEN to
+    'can't tell', not block — only a session confirmed to be a client chat
+    is restricted."""
+    assert plugin._pre_tool_call(
+        tool_name="telegram_search", args={"query": "hello"}, session_id="unknown-session",
+    ) is None
+    assert plugin._pre_tool_call(
+        tool_name="telegram_search", args={"query": "hello"},
+    ) is None  # no session_id kwarg at all
