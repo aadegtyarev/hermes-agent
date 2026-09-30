@@ -1,6 +1,6 @@
 ---
 name: archive-guide
-description: Как работать с архивами через archive_* тулы — список содержимого, распаковка (zip/rar/7z/tar/…), упаковка. Без терминала.
+description: "Смотреть/распаковать/запаковать архивы zip/rar/7z/tar."
 version: 1.0.0
 author: multi-agent
 platforms: [linux]

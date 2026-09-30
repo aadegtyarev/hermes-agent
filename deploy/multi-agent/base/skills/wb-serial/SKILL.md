@@ -1,6 +1,6 @@
 ---
 name: wb-serial
-description: "Serial bus (RS-485/Modbus) on WB — custom templates, adding devices via confed, and diagnostics: CRC errors, timeouts, device not responding, slow polling, bus scan, health check."
+description: "Diagnose RS-485/Modbus on WB: CRC errors, timeouts, scan."
 allowed-tools: Bash Read Write WebFetch WebSearch
 ---
 

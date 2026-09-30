@@ -1,6 +1,6 @@
 ---
 name: vault-guide
-description: Как доставать секреты из Bitwarden через vault_* тулы — найти элемент, получить пароль/поле/TOTP. Не хранить секреты в открытую.
+description: "Достать секрет из Bitwarden: пароль/поле/TOTP."
 version: 1.0.0
 author: multi-agent
 platforms: [linux]

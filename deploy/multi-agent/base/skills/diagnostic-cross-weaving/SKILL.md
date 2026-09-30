@@ -1,6 +1,6 @@
 ---
 name: diagnostic-cross-weaving
-description: Сформулировать проблему, методично собрать факты по трём независимым линиям, свести в корень. Без fabrication и экстраполяции.
+description: "Собери факты по 3 независимым линиям, сведи к корню."
 version: 1.5.0
 author: multi-agent
 platforms: [linux]
