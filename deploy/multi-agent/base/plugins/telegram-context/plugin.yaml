@@ -1,6 +1,6 @@
 name: telegram-context
-version: 1.0.0
-description: "Telegram ingest + gating + thread reconstruction. One pre_gateway_dispatch hook: chat allowlist (work vs read-only vs ignore, env ∪ runtime store), auto-collected DM allowlist (work-chat members, getChatMember-verified), message ingest, and /hermes_* admin commands to enrol/drop the current chat at runtime (no file edits). Tools: telegram_thread/recent/search/dm_allowlist. Env: TELEGRAM_WORK_CHATS, TELEGRAM_READONLY_CHATS, TELEGRAM_DM_EXTRA_USERS, TELEGRAM_ADMIN_USERS."
+version: 2.0.0
+description: "Telegram ingest + gating + thread reconstruction + isolated client chats. pre_gateway_dispatch: chat allowlist (work/read-only/client, env ∪ runtime store), auto-collected DM allowlist (work-chat members only — client chats never grant DM access), message ingest, /hermes_* admin commands (enrol/drop a chat, list, /hermes_program to create a program or register a client chat). pre_tool_call: hard read-only send-block + one-directional cross-chat isolation for client-mode sessions (telegram_search/recent pinned to own chat, session_search/gdrive_search blocked, gdoc_read/comments pinned to docs seen in-chat, send_message pinned to own chat). Tools: telegram_thread/recent/search/dm_allowlist, escalate_to_team (client chats only). A separate cron job (client-chat-batch-review) + its own partner_flag_chats tool (own toolset, not exposed to normal turns) catches partner messages that never @-mention the bot. Env: TELEGRAM_WORK_CHATS, TELEGRAM_READONLY_CHATS, TELEGRAM_DM_EXTRA_USERS, TELEGRAM_ADMIN_USERS, TELEGRAM_HOME_CHANNEL."
 author: multi-agent
 kind: standalone
 requires_env: []
@@ -9,5 +9,9 @@ provides_tools:
   - telegram_recent
   - telegram_search
   - telegram_dm_allowlist
+  - escalate_to_team
+  - partner_flag_chats
 provides_hooks:
   - pre_gateway_dispatch
+  - pre_tool_call
+  - telegram_chat_member_left
