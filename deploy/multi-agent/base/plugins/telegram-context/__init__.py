@@ -5,6 +5,14 @@ One `pre_gateway_dispatch` hook does four things for Telegram:
        TELEGRAM_WORK_CHATS      → bot responds here; posters auto-added to the DM allowlist.
        TELEGRAM_READONLY_CHATS  → ingested for context, but the bot never replies (observe-only).
        (unset work+readonly → allow everything, so setup isn't locked out.)
+     Every dispatched Telegram event also mirrors this plugin's live readonly set
+     (env ∪ the /hermes_readonly runtime store) into the core TelegramAdapter's
+     own `read_only_chats` — see `_sync_core_read_only()`. This gate above only
+     ever skipped *dispatch*; the core mirror additionally hard-blocks the
+     adapter's own send()/edit_message()/send_typing(), so a chat marked
+     read-only here can truly never receive anything from the bot through any
+     code path, not just this hook. Takes effect immediately (no restart) —
+     `/hermes_readonly` is live on the very next message.
   2. DM allowlist — a DM is answered only if the sender is allowlisted: a work-chat
      member (auto-collected + live getChatMember check) or TELEGRAM_DM_EXTRA_USERS.
      Members of the read-only public chat do NOT gain DM access.
@@ -261,11 +269,37 @@ def _dm_allowed(uid: str) -> bool:
     return _live_member(uid)
 
 
+def _sync_core_read_only(gateway) -> None:
+    """Mirror this plugin's read-only chat list into the core adapter's hard
+    send-level guard (``telegram.read_only_chats`` / ``TelegramAdapter.
+    _telegram_read_only_chats()``).
+
+    ``/hermes_readonly`` only ever gated *dispatch* here — this hook returns
+    ``{"action": "skip"}`` before the agent runs a turn, but that never
+    reached the adapter's own ``send()``/``edit_message()``/``send_typing()``
+    guard, which is the actual defense against anything else (a stray code
+    path, a cron delivery, a bug in this hook) ever writing to that chat.
+    Pushing the plugin's live readonly set (env ∪ runtime store) into the
+    adapter's ``config.extra`` keeps the two in sync automatically — that
+    dict is read fresh on every adapter call, not cached, so this takes
+    effect immediately, no container restart needed.
+    """
+    try:
+        from gateway.config import Platform
+        adapter = getattr(gateway, "adapters", {}).get(Platform.TELEGRAM)
+        if adapter is None or not hasattr(adapter, "config"):
+            return
+        adapter.config.extra["read_only_chats"] = sorted(_readonly_chats())
+    except Exception as e:  # noqa: BLE001
+        logger.warning("telegram-context: failed to sync core read_only_chats: %s", e)
+
+
 def _on_dispatch(event=None, gateway=None, session_store=None, **kwargs):
     try:
         src = getattr(event, "source", None)
         if src is None or "telegram" not in str(getattr(src, "platform", "")).lower():
             return None
+        _sync_core_read_only(gateway)
         _clear_group_command_menu()  # keep the group "/" menu blank (throttled)
         chat_id = str(getattr(src, "chat_id", "") or "")
         ctype = (getattr(src, "chat_type", "") or "").lower()
