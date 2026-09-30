@@ -15,6 +15,7 @@ from __future__ import annotations
 import re
 import sqlite3
 import threading
+import time
 
 from hermes_constants import get_hermes_home
 
@@ -67,16 +68,43 @@ def init() -> None:
             "INSERT INTO messages_fts(messages_fts, rowid, text) VALUES('delete', old.rowid, old.text); "
             "INSERT INTO messages_fts(rowid, text) VALUES (new.rowid, new.text); END"
         )
-        # One-time backfill for rows ingested before this table existed —
-        # INSERT OR REPLACE below only triggers on rows written from here on.
-        # Cheap to re-check: no-op once the counts already match.
-        fts_count = c.execute("SELECT COUNT(*) FROM messages_fts").fetchone()[0]
-        msg_count = c.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
-        if fts_count < msg_count:
+        # One-time backfill for rows ingested before this table existed — the
+        # triggers above only cover rows written from here on.
+        #
+        # NOTE on a real bug this replaced: for an external-content FTS5 table
+        # (content='messages'), a plain `SELECT ... FROM messages_fts` — even
+        # `COUNT(*)`, even with no WHERE at all — passes straight through to
+        # the content table regardless of whether the actual search index
+        # has anything in it. A prior version of this backfill compared
+        # `COUNT(*) FROM messages_fts` against `COUNT(*) FROM messages` (and,
+        # separately, a LEFT JOIN against messages_fts) to decide whether to
+        # backfill — both always report "already populated" even on a
+        # freshly created, completely empty index, because the row identity
+        # pass-through has nothing to do with whether MATCH can find
+        # anything. The result: on the very first deploy of this table
+        # against an already-populated telegram.db, every row read back as
+        # "already indexed" and the backfill silently never ran — MATCH
+        # found nothing for ANY query, for ANY word, including exact
+        # substrings verified present in the raw text. Only newly-added rows
+        # (via the triggers) were ever searchable.
+        #
+        # Fix: track completion explicitly in a real (non-virtual) table,
+        # and use FTS5's own `INSERT INTO messages_fts(messages_fts) VALUES
+        # ('rebuild')` command — the documented, correct way to (re)populate
+        # an external-content index from scratch — instead of hand-rolling
+        # a row-by-row copy whose "already done" detection doesn't work for
+        # this table type.
+        c.execute(
+            "CREATE TABLE IF NOT EXISTS fts_migration_state(key TEXT PRIMARY KEY, done_at REAL)"
+        )
+        already_rebuilt = c.execute(
+            "SELECT 1 FROM fts_migration_state WHERE key='messages_fts_rebuilt'"
+        ).fetchone()
+        if not already_rebuilt:
+            c.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
             c.execute(
-                "INSERT INTO messages_fts(rowid, text) "
-                "SELECT m.rowid, m.text FROM messages m "
-                "LEFT JOIN messages_fts f ON f.rowid = m.rowid WHERE f.rowid IS NULL"
+                "INSERT INTO fts_migration_state(key, done_at) VALUES('messages_fts_rebuilt', ?)",
+                (time.time(),),
             )
         # Auto-collected DM allowlist: users seen in / confirmed members of work chats.
         c.execute(
