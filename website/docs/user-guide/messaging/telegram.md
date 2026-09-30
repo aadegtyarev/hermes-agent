@@ -157,6 +157,36 @@ TELEGRAM_OBSERVE_UNMENTIONED_GROUP_MESSAGES=true
 
 This requires Telegram to deliver ordinary group messages to the gateway, so disable BotFather privacy mode or promote the bot to group admin as described above.
 
+### Read-only chats: a hard, code-level no-reply guarantee
+
+For a group you want to use purely as an information source — say, a
+project chat you build [digests/reports](../sessions.md#building-a-chat-digestreport) from —
+`observe_unmentioned_group_messages` above still isn't quite silent: a
+direct `@botname` mention or reply to the bot in that group *will* still
+get an answer. `read_only_chats` closes that gap:
+
+```yaml
+telegram:
+  read_only_chats:
+    - "-1001234567890"
+```
+
+A chat_id listed here gets a hard guarantee enforced in code, not just a
+trigger heuristic: the bot **never sends anything to it** — not a reply
+to a direct mention, not a cron delivery, not a background notification —
+while every message in it (including ones that mention the bot) is still
+captured for later reporting. `read_only_chats` is self-sufficient: you
+don't need to also set `allowed_chats`/`group_allowed_chats`/
+`observe_unmentioned_group_messages` for that specific chat, and it
+overrides `free_response_chats`/`guest_mode` if a chat_id ends up in more
+than one list.
+
+Equivalent environment variable:
+
+```bash
+TELEGRAM_READ_ONLY_CHATS=-1001234567890
+```
+
 ## Step 4: Find Your User ID
 
 Hermes Agent uses numeric Telegram user IDs to control access. Your user ID is **not** your username — it's a number like `123456789`.

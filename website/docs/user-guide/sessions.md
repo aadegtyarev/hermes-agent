@@ -523,6 +523,37 @@ Database size: 12.4 MB
 
 For deeper analytics — token usage, cost estimates, tool breakdown, and activity patterns — use [`hermes insights`](/reference/cli-commands#hermes-insights).
 
+### Building a Chat Digest/Report
+
+`hermes sessions digest` pages through a single chat's message history
+within a time window — including Telegram's
+[observed group chatter](/docs/user-guide/messaging/telegram#observe-group-chatter-without-auto-replying)
+that never triggered a reply — so you (or the agent) can build a topic
+report over a week, a month, or longer without the raw history ever
+exceeding a model's context in one shot.
+
+```bash
+# Cheap first call: total matching messages / time span / approx size,
+# no content — decide how to batch before pulling anything
+hermes sessions digest --chat-id -1001234567890 --source telegram \
+  --since 7d --count-only
+
+# Page through in bounded batches (id-based cursor, no gaps/dupes)
+hermes sessions digest --chat-id -1001234567890 --source telegram \
+  --since 7d --cursor 0 --limit 300
+
+# Narrow by topic (plain case-insensitive substring, not FTS syntax)
+hermes sessions digest --chat-id -1001234567890 --source telegram \
+  --since 30d --query "deploy"
+```
+
+Each batch ends with a `=== META {...} ===` line (`--format jsonl`: a
+final `{"_meta": {...}}` line) reporting `has_more`/`next_cursor` for the
+next call. For long windows, ask the agent to build the report — it uses
+the `telegram-chat-digest` skill to page through in the background via
+`delegate_task` and hand back only the finished report, never the raw
+per-batch dumps.
+
 ## Session Search Tool
 
 The agent has a built-in `session_search` tool that performs full-text search across all past conversations using SQLite's FTS5 engine — and lets the agent scroll through any session it finds. No LLM calls, no summarization, no truncation. Every shape returns actual messages from the DB.

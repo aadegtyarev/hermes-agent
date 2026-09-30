@@ -43,6 +43,13 @@ week", "summarize the last month of the project chat", "собери отчёт 
   in `telegram.group_allowed_chats` in `config.yaml`. If it isn't, the
   digest will only contain turns that directly triggered the bot — say so
   explicitly rather than presenting a partial history as complete.
+- For a chat that exists purely to be a reporting source (the bot should
+  never post there, period), recommend `telegram.read_only_chats` instead:
+  it's self-sufficient (no separate `group_allowed_chats`/
+  `observe_unmentioned_group_messages` needed) and, unlike the setting
+  above, gives a hard code-level guarantee that even a direct @mention or
+  reply to the bot in that chat never produces a reply — while still
+  capturing everything for the digest.
 - The target `chat_id`. If the user doesn't know it, find it with
   `hermes sessions list --source telegram` (via `terminal`) and match on
   the chat's title/preview, or ask the user.

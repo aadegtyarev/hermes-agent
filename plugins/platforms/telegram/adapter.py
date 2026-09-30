@@ -3582,6 +3582,16 @@ class TelegramAdapter(BasePlatformAdapter):
         if getattr(self, "_send_path_degraded", False):
             return SendResult(success=False, error="send_path_degraded", retryable=True)
 
+        # Hard code-level guarantee for read-only chats: never send, no matter
+        # what triggered the call (a mention that slipped past the trigger
+        # gate, a cron delivery, a background notification, ...). This is the
+        # actual safety net — _should_process_message() below is only the
+        # (bypassable-in-theory) fast path that avoids spinning up a reply in
+        # the first place.
+        if str(chat_id) in self._telegram_read_only_chats():
+            logger.info("[%s] Suppressed send to read-only chat %s", self.name, chat_id)
+            return SendResult(success=False, error="chat_is_read_only", retryable=False)
+
         # Skip whitespace-only text to prevent Telegram 400 empty-text errors.
         if not content or not content.strip():
             return SendResult(success=True, message_id=None)
@@ -3949,6 +3959,10 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+
+        if str(chat_id) in self._telegram_read_only_chats():
+            logger.info("[%s] Suppressed edit in read-only chat %s", self.name, chat_id)
+            return SendResult(success=False, error="chat_is_read_only", retryable=False)
 
         # Rich finalize (Bot API 10.1): when the completed content has
         # constructs the legacy MarkdownV2 edit degrades (tables → bullet
@@ -6442,6 +6456,8 @@ class TelegramAdapter(BasePlatformAdapter):
         """Send typing indicator."""
         if not self._bot or self._typing_in_cooldown(chat_id):
             return
+        if str(chat_id) in self._telegram_read_only_chats():
+            return
 
         _is_dm_topic: bool = False
         message_thread_id: Optional[int] = None
@@ -6736,6 +6752,26 @@ class TelegramAdapter(BasePlatformAdapter):
         raw = self.config.extra.get("free_response_chats")
         if raw is None:
             raw = os.getenv("TELEGRAM_FREE_RESPONSE_CHATS", "")
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        return {part.strip() for part in str(raw).split(",") if part.strip()}
+
+    def _telegram_read_only_chats(self) -> set[str]:
+        """Chats the bot must never write to — a hard, code-level guarantee.
+
+        A chat_id here is self-sufficient: it (a) blocks every outbound
+        send/edit/typing-indicator to that chat regardless of what
+        triggered it — a mention, a reply, a cron delivery, a background
+        notification — and (b) makes every message in it observable for
+        ``hermes sessions digest`` with no separate ``group_allowed_chats``/
+        ``observe_unmentioned_group_messages`` configuration needed. It
+        always wins over ``allowed_chats``/``free_response_chats``/
+        ``guest_mode`` if a chat_id is ever (mis)configured in more than
+        one of these lists.
+        """
+        raw = self.config.extra.get("read_only_chats")
+        if raw is None:
+            raw = os.getenv("TELEGRAM_READ_ONLY_CHATS", "")
         if isinstance(raw, list):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
@@ -7057,8 +7093,6 @@ class TelegramAdapter(BasePlatformAdapter):
         """Return True when a group message should be stored but not dispatched."""
         if self._is_own_message(message):
             return False
-        if not self._telegram_observe_unmentioned_group_messages():
-            return False
         if not self._is_group_chat(message):
             return False
 
@@ -7078,6 +7112,18 @@ class TelegramAdapter(BasePlatformAdapter):
 
         chat_id_str = str(getattr(getattr(message, "chat", None), "id", ""))
         if self._telegram_exclusive_bot_mentions() and self._explicit_bot_mentions_exclude_self(message):
+            return False
+
+        # read_only_chats is self-sufficient: it doesn't need
+        # observe_unmentioned_group_messages/group_allowed_chats configured
+        # separately, and — unlike the ordinary observe path below — it
+        # must still capture messages that mention/reply to the bot, since
+        # those are hard-blocked from ever triggering a real response (see
+        # _should_process_message() and the read-only guard in send()).
+        if chat_id_str in self._telegram_read_only_chats():
+            return True
+
+        if not self._telegram_observe_unmentioned_group_messages():
             return False
 
         allowed = self._telegram_observe_allowed_chats()
@@ -7411,6 +7457,16 @@ class TelegramAdapter(BasePlatformAdapter):
         # messages).  Without this, outbound messages are counted as incoming
         # unread in the Hermes inbox (#52363).
         if self._is_own_message(message):
+            return False
+
+        # Hard, code-level guarantee: a read-only chat never gets a reply,
+        # not even to a direct @mention/reply/wake-word match. Checked
+        # before every other gate (allowed_chats/guest_mode/
+        # free_response_chats/require_mention) so none of those can
+        # override it if a chat_id is ever configured in more than one
+        # list.
+        chat_id_str = str(getattr(getattr(message, "chat", None), "id", ""))
+        if chat_id_str in self._telegram_read_only_chats():
             return False
 
         if not self._is_group_chat(message):
