@@ -1,6 +1,8 @@
 """Telegram context tools — read the ingested message store."""
 from __future__ import annotations
 
+import time
+
 from tools.registry import tool_error, tool_result
 
 from . import store
@@ -23,6 +25,29 @@ def _chat(args) -> str | None:
     return str(args.get("chat_id") or "").strip() or store.latest_chat()
 
 
+def _since_until(args) -> tuple[float | None, float | None]:
+    """Parse optional 'since_hours_ago'/'until_hours_ago' into epoch bounds.
+
+    Hours-ago (not raw timestamps) because that's what an agent building a
+    report actually reasons in ("last week" -> since_hours_ago=168) — no
+    date-arithmetic footgun for the model to get wrong.
+    """
+    now = time.time()
+    since = args.get("since_hours_ago")
+    until = args.get("until_hours_ago")
+    since_ts = now - float(since) * 3600 if since is not None else None
+    until_ts = now - float(until) * 3600 if until is not None else None
+    return since_ts, until_ts
+
+
+_WINDOW_PARAMS = {
+    "since_hours_ago": {"type": "number", "description": "Only messages from at most this many hours ago (e.g. 168 for the last week)."},
+    "until_hours_ago": {"type": "number", "description": "Only messages from at least this many hours ago (default: now)."},
+    "cursor": {"type": "integer", "description": "Resume pagination after this value (from a prior call's next_cursor). Pass 0 to start walking the window from its oldest message — omit entirely for the old 'most recent N' behavior."},
+    "count_only": {"type": "boolean", "description": "Report total matching messages / time span / approx size only, no content — check this before paging a large window (e.g. building a report over weeks/months)."},
+}
+
+
 TELEGRAM_THREAD = {"name": "telegram_thread", "description": (
     "Reconstruct a Telegram thread from stored messages: the reply chain up to the root plus all "
     "replies below, in chronological order, with who replied to whom."),
@@ -31,18 +56,27 @@ TELEGRAM_THREAD = {"name": "telegram_thread", "description": (
         "chat_id": {"type": "string", "description": "Chat id (default: the most recently active chat)."}},
         "required": ["message_id"]}}
 
-TELEGRAM_RECENT = {"name": "telegram_recent", "description": "Recent messages in a chat, chronological (default: current/latest chat).",
+TELEGRAM_RECENT = {"name": "telegram_recent", "description": (
+    "Recent messages in a chat, chronological (default: current/latest chat, "
+    "last N messages). Pass since_hours_ago/until_hours_ago + cursor to instead "
+    "walk an entire time window page by page — e.g. for a topic report/digest "
+    "over weeks or months, too much to fit in one call. Check count_only first "
+    "to see how much there is before paging."),
     "parameters": {"type": "object", "properties": {
         "chat_id": {"type": "string", "description": "Chat id (default: latest active chat)."},
-        "limit": {"type": "integer", "description": "Max messages (default 50)."}},
-        "required": []}}
+        "limit": {"type": "integer", "description": "Max messages per call (default 50, max 500)."},
+        **_WINDOW_PARAMS}, "required": []}}
 
-TELEGRAM_SEARCH = {"name": "telegram_search", "description": "Text search across stored Telegram messages (optionally within one chat).",
+TELEGRAM_SEARCH = {"name": "telegram_search", "description": (
+    "Text search across stored Telegram messages (optionally within one chat), "
+    "most recent matches by default. Pass since_hours_ago/until_hours_ago + "
+    "cursor to instead walk every match in a time window exhaustively — check "
+    "count_only first to see how many matches there are before paging."),
     "parameters": {"type": "object", "properties": {
         "query": {"type": "string", "description": "Substring to search for."},
         "chat_id": {"type": "string", "description": "Restrict to a chat (default: all chats)."},
-        "limit": {"type": "integer", "description": "Max results (default 50)."}},
-        "required": ["query"]}}
+        "limit": {"type": "integer", "description": "Max results per call (default 50, max 500)."},
+        **_WINDOW_PARAMS}, "required": ["query"]}}
 
 TELEGRAM_DM_ALLOWLIST = {"name": "telegram_dm_allowlist", "description": "List users auto-collected into the DM allowlist (from work chats).",
     "parameters": {"type": "object", "properties": {}, "required": []}}
@@ -65,24 +99,47 @@ def handle_telegram_recent(args, **kw):
     chat = _chat(args)
     if not chat:
         return tool_error("No chat to read (store empty). Pass 'chat_id' or wait for messages.")
+    since_ts, until_ts = _since_until(args)
+
+    if args.get("count_only"):
+        return tool_result({"chat_id": chat, **store.count(chat, since_ts, until_ts)})
+
     try:
         limit = int(args.get("limit", 50))
     except (TypeError, ValueError):
         limit = 50
-    rows = store.recent(chat, min(limit, 500))
-    return tool_result({"chat_id": chat, "count": len(rows), "messages": _fmt(rows)})
+    cursor = args.get("cursor")
+    after_id = int(cursor) if cursor is not None else None
+
+    page = store.recent(chat, min(limit, 500), since_ts, until_ts, after_id)
+    return tool_result({
+        "chat_id": chat, "count": len(page["messages"]), "messages": _fmt(page["messages"]),
+        "has_more": page["has_more"], "next_cursor": page["next_cursor"],
+    })
 
 
 def handle_telegram_search(args, **kw):
     q = str(args.get("query") or "").strip()
     if not q:
         return tool_error("telegram_search needs 'query' (a substring). Example: telegram_search(query='CRC error').")
+    chat_id = str(args.get("chat_id") or "").strip() or None
+    since_ts, until_ts = _since_until(args)
+
+    if args.get("count_only"):
+        return tool_result({"query": q, **store.count(chat_id, since_ts, until_ts, query=q)})
+
     try:
         limit = int(args.get("limit", 50))
     except (TypeError, ValueError):
         limit = 50
-    rows = store.search(q, str(args.get("chat_id") or "").strip() or None, min(limit, 500))
-    return tool_result({"query": q, "count": len(rows), "matches": _fmt(rows)})
+    cursor = args.get("cursor")
+    after_id = int(cursor) if cursor is not None else None
+
+    page = store.search(q, chat_id, min(limit, 500), since_ts, until_ts, after_id)
+    return tool_result({
+        "query": q, "count": len(page["messages"]), "matches": _fmt(page["messages"]),
+        "has_more": page["has_more"], "next_cursor": page["next_cursor"],
+    })
 
 
 def handle_telegram_dm_allowlist(args, **kw):

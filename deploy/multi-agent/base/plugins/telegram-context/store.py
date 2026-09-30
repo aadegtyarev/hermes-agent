@@ -3,6 +3,12 @@
 The Bot API can't fetch history, so we persist messages as they arrive (via the
 ingest hook) and reconstruct threads / recent / search from here. Isolated per
 agent (its own data volume).
+
+``recent()``/``search()`` double as a topic-report/digest source: pass
+``since``/``until`` + ``after_id`` (cursor, 0 = start of the window) to walk an
+entire time window page by page (SQLite ``rowid`` order — monotonic insertion
+order) instead of the plain "last N" behavior. ``count()`` is the cheap
+upfront check for how much there is before paging a large window.
 """
 from __future__ import annotations
 
@@ -128,30 +134,127 @@ def latest_chat() -> str | None:
         return r["chat_id"] if r else None
 
 
-def recent(chat_id: str, limit: int, since: float | None = None) -> list[dict]:
-    q, args = "SELECT * FROM messages WHERE chat_id=?", [chat_id]
-    if since:
-        q += " AND ts>=?"
+def recent(chat_id: str, limit: int, since: float | None = None, until: float | None = None,
+           after_id: int | None = None) -> dict:
+    """Messages for a chat.
+
+    ``after_id=None`` (default): the most recent ``limit`` messages in the
+    window, oldest->newest — today's "what just happened" behavior, unchanged.
+
+    ``after_id`` given (0 = from the start of the window): forward,
+    chronological pagination — the next ``limit`` messages strictly after
+    that cursor (SQLite ``rowid``, monotonic insertion order). Keep paging
+    with the returned ``next_cursor`` while ``has_more`` is true to walk an
+    entire time window exhaustively (a digest/report) without missing or
+    duplicating rows — the thing plain LIMIT-capped recent/search can't do
+    for a window bigger than the cap.
+    """
+    where, args = "chat_id=?", [chat_id]
+    if since is not None:
+        where += " AND ts>=?"
         args.append(since)
-    q += " ORDER BY ts DESC LIMIT ?"
-    args.append(limit)
+    if until is not None:
+        where += " AND ts<=?"
+        args.append(until)
+
+    paginating = after_id is not None
+    if paginating:
+        where += " AND rowid>?"
+        args.append(after_id)
+        order = "ORDER BY rowid ASC"
+    else:
+        order = "ORDER BY rowid DESC"
+
+    fetch_limit = max(1, min(int(limit), 500))
     with _conn() as c:
-        return [dict(r) for r in c.execute(q, args).fetchall()][::-1]
+        rows = [dict(r) for r in c.execute(
+            f"SELECT rowid, * FROM messages WHERE {where} {order} LIMIT ?",
+            [*args, fetch_limit + 1],
+        ).fetchall()]
+
+    has_more = len(rows) > fetch_limit
+    rows = rows[:fetch_limit]
+    if not paginating:
+        rows = rows[::-1]  # DESC fetch -> chronological order for display
+
+    next_cursor = rows[-1]["rowid"] if (has_more and paginating) else None
+    return {"messages": rows, "has_more": has_more, "next_cursor": next_cursor}
 
 
-def search(query: str, chat_id: str | None, limit: int) -> list[dict]:
+def count(chat_id: str | None, since: float | None = None, until: float | None = None,
+          query: str | None = None) -> dict:
+    """Total matching messages / time span / approx size for a chat (or, with
+    chat_id=None, every chat) + window — a cheap upfront check before paging
+    through a large window. Pass ``query`` to count search matches (same LIKE
+    filter as :func:`search`) instead of every message in the window."""
+    where, args = "1=1", []
+    if chat_id:
+        where += " AND chat_id=?"
+        args.append(chat_id)
+    if since is not None:
+        where += " AND ts>=?"
+        args.append(since)
+    if until is not None:
+        where += " AND ts<=?"
+        args.append(until)
+    if query:
+        where += " AND text LIKE ?"
+        args.append(f"%{query}%")
     with _conn() as c:
-        if chat_id:
-            rows = c.execute(
-                "SELECT * FROM messages WHERE chat_id=? AND text LIKE ? ORDER BY ts DESC LIMIT ?",
-                (chat_id, f"%{query}%", limit),
-            ).fetchall()
-        else:
-            rows = c.execute(
-                "SELECT * FROM messages WHERE text LIKE ? ORDER BY ts DESC LIMIT ?",
-                (f"%{query}%", limit),
-            ).fetchall()
-        return [dict(r) for r in rows]
+        r = c.execute(
+            f"SELECT COUNT(*) AS n, MIN(ts) AS oldest, MAX(ts) AS newest, "
+            f"SUM(LENGTH(text)) AS chars FROM messages WHERE {where}",
+            args,
+        ).fetchone()
+    return {
+        "total_count": r["n"] or 0,
+        "oldest_ts": r["oldest"],
+        "newest_ts": r["newest"],
+        "approx_chars": r["chars"] or 0,
+    }
+
+
+def search(query: str, chat_id: str | None, limit: int, since: float | None = None,
+           until: float | None = None, after_id: int | None = None) -> dict:
+    """Text search across stored messages.
+
+    Same ``after_id``/pagination contract as :func:`recent` — omit it for a
+    plain "most recent N matches" search, pass it (0 to start) to walk every
+    match in a time window exhaustively.
+    """
+    where, args = "text LIKE ?", [f"%{query}%"]
+    if chat_id:
+        where += " AND chat_id=?"
+        args.append(chat_id)
+    if since is not None:
+        where += " AND ts>=?"
+        args.append(since)
+    if until is not None:
+        where += " AND ts<=?"
+        args.append(until)
+
+    paginating = after_id is not None
+    if paginating:
+        where += " AND rowid>?"
+        args.append(after_id)
+        order = "ORDER BY rowid ASC"
+    else:
+        order = "ORDER BY rowid DESC"
+
+    fetch_limit = max(1, min(int(limit), 500))
+    with _conn() as c:
+        rows = [dict(r) for r in c.execute(
+            f"SELECT rowid, * FROM messages WHERE {where} {order} LIMIT ?",
+            [*args, fetch_limit + 1],
+        ).fetchall()]
+
+    has_more = len(rows) > fetch_limit
+    rows = rows[:fetch_limit]
+    if not paginating:
+        rows = rows[::-1]
+
+    next_cursor = rows[-1]["rowid"] if (has_more and paginating) else None
+    return {"messages": rows, "has_more": has_more, "next_cursor": next_cursor}
 
 
 def thread(chat_id: str, message_id: str) -> list[dict]:
