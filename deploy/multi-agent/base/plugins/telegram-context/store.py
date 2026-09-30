@@ -12,6 +12,7 @@ upfront check for how much there is before paging a large window.
 """
 from __future__ import annotations
 
+import re
 import sqlite3
 import threading
 
@@ -42,6 +43,41 @@ def init() -> None:
                 PRIMARY KEY (chat_id, message_id))"""
         )
         c.execute("CREATE INDEX IF NOT EXISTS idx_chat_ts ON messages(chat_id, ts)")
+
+        # Full-text index over messages.text (FTS5, unicode61 tokenizer — folds
+        # case correctly for Cyrillic, unlike plain SQL LIKE, and tokenizes
+        # instead of doing a raw substring scan). External-content table keyed
+        # by the base table's own (implicit) rowid, kept in sync by triggers so
+        # every write path (just `add()` today) stays a single INSERT OR
+        # REPLACE with no FTS-specific bookkeeping at the call site.
+        c.execute(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5("
+            "text, content='messages', content_rowid='rowid')"
+        )
+        c.execute(
+            "CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN "
+            "INSERT INTO messages_fts(rowid, text) VALUES (new.rowid, new.text); END"
+        )
+        c.execute(
+            "CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN "
+            "INSERT INTO messages_fts(messages_fts, rowid, text) VALUES('delete', old.rowid, old.text); END"
+        )
+        c.execute(
+            "CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN "
+            "INSERT INTO messages_fts(messages_fts, rowid, text) VALUES('delete', old.rowid, old.text); "
+            "INSERT INTO messages_fts(rowid, text) VALUES (new.rowid, new.text); END"
+        )
+        # One-time backfill for rows ingested before this table existed —
+        # INSERT OR REPLACE below only triggers on rows written from here on.
+        # Cheap to re-check: no-op once the counts already match.
+        fts_count = c.execute("SELECT COUNT(*) FROM messages_fts").fetchone()[0]
+        msg_count = c.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+        if fts_count < msg_count:
+            c.execute(
+                "INSERT INTO messages_fts(rowid, text) "
+                "SELECT m.rowid, m.text FROM messages m "
+                "LEFT JOIN messages_fts f ON f.rowid = m.rowid WHERE f.rowid IS NULL"
+            )
         # Auto-collected DM allowlist: users seen in / confirmed members of work chats.
         c.execute(
             """CREATE TABLE IF NOT EXISTS dm_allowed(
@@ -185,25 +221,35 @@ def count(chat_id: str | None, since: float | None = None, until: float | None =
           query: str | None = None) -> dict:
     """Total matching messages / time span / approx size for a chat (or, with
     chat_id=None, every chat) + window — a cheap upfront check before paging
-    through a large window. Pass ``query`` to count search matches (same LIKE
-    filter as :func:`search`) instead of every message in the window."""
+    through a large window. Pass ``query`` to count search matches (same FTS5
+    match as :func:`search`) instead of every message in the window."""
     where, args = "1=1", []
     if chat_id:
-        where += " AND chat_id=?"
+        where += " AND m.chat_id=?"
         args.append(chat_id)
     if since is not None:
-        where += " AND ts>=?"
+        where += " AND m.ts>=?"
         args.append(since)
     if until is not None:
-        where += " AND ts<=?"
+        where += " AND m.ts<=?"
         args.append(until)
-    if query:
-        where += " AND text LIKE ?"
-        args.append(f"%{query}%")
+
+    fts_query = _fts5_prefix_query(query) if query else None
+    if fts_query:
+        where = "messages_fts MATCH ? AND " + where
+        args = [fts_query, *args]
+        from_clause = "messages_fts JOIN messages m ON m.rowid = messages_fts.rowid"
+    elif query:
+        # A query was given but tokenized to nothing (punctuation-only) —
+        # no message could ever match; skip straight to a zero result.
+        return {"total_count": 0, "oldest_ts": None, "newest_ts": None, "approx_chars": 0}
+    else:
+        from_clause = "messages m"
+
     with _conn() as c:
         r = c.execute(
-            f"SELECT COUNT(*) AS n, MIN(ts) AS oldest, MAX(ts) AS newest, "
-            f"SUM(LENGTH(text)) AS chars FROM messages WHERE {where}",
+            f"SELECT COUNT(*) AS n, MIN(m.ts) AS oldest, MAX(m.ts) AS newest, "
+            f"SUM(LENGTH(m.text)) AS chars FROM {from_clause} WHERE {where}",
             args,
         ).fetchone()
     return {
@@ -214,37 +260,77 @@ def count(chat_id: str | None, since: float | None = None, until: float | None =
     }
 
 
+_FTS5_TOKEN_RE = re.compile(r"[^\W_]+", re.UNICODE)
+
+
+def _fts5_prefix_query(text: str) -> str | None:
+    """Build a safe FTS5 query: every word in ``text`` becomes a prefix term,
+    ANDed together (FTS5's default for space-separated bare terms).
+
+    Two reasons for prefix-per-word rather than an exact or phrase match:
+
+    - Russian is heavily inflected — "прошивка"/"прошивку"/"прошивки" differ
+      only in their ending, and FTS5's unicode61 tokenizer has no stemmer.
+      Searching "прошив*" matches all of them; an exact-word match would
+      require the searcher to guess the exact grammatical form used in the
+      message. Case-folding (unlike plain SQL LIKE) works correctly either
+      way — this is on top of that fix, not instead of it.
+    - Tokens are extracted with a plain word-character regex, never fed to
+      FTS5 raw, so arbitrary punctuation in the input (quotes, colons,
+      parens, a stray ``*``) can never produce invalid FTS5 syntax.
+    - Each token is quoted (``"word"*``, not bare ``word*``) so a token that
+      happens to BE an FTS5 keyword ("or", "and", "not" — case-insensitively;
+      a query like "a or b" is entirely plausible chat text) is forced to
+      parse as a literal search term instead of a boolean operator, which a
+      bare ``OR*``/``AND*``/``NOT*`` raises a syntax error on (verified: the
+      quoted form still supports the prefix ``*``, unlike quoting the whole
+      multi-word phrase, which does not).
+
+    Returns ``None`` for a punctuation-only/empty query (nothing to search).
+    """
+    tokens = _FTS5_TOKEN_RE.findall(text)
+    if not tokens:
+        return None
+    return " ".join(f'"{t}"*' for t in tokens)
+
+
 def search(query: str, chat_id: str | None, limit: int, since: float | None = None,
            until: float | None = None, after_id: int | None = None) -> dict:
-    """Text search across stored messages.
+    """Full-text search across stored messages (SQLite FTS5 — tokenized,
+    case-folds correctly for Cyrillic, unlike a plain LIKE substring scan).
 
     Same ``after_id``/pagination contract as :func:`recent` — omit it for a
     plain "most recent N matches" search, pass it (0 to start) to walk every
     match in a time window exhaustively.
     """
-    where, args = "text LIKE ?", [f"%{query}%"]
+    fts_query = _fts5_prefix_query(query)
+    if fts_query is None:
+        return {"messages": [], "has_more": False, "next_cursor": None}
+    where, args = "messages_fts MATCH ?", [fts_query]
     if chat_id:
-        where += " AND chat_id=?"
+        where += " AND m.chat_id=?"
         args.append(chat_id)
     if since is not None:
-        where += " AND ts>=?"
+        where += " AND m.ts>=?"
         args.append(since)
     if until is not None:
-        where += " AND ts<=?"
+        where += " AND m.ts<=?"
         args.append(until)
 
     paginating = after_id is not None
     if paginating:
-        where += " AND rowid>?"
+        where += " AND m.rowid>?"
         args.append(after_id)
-        order = "ORDER BY rowid ASC"
+        order = "ORDER BY m.rowid ASC"
     else:
-        order = "ORDER BY rowid DESC"
+        order = "ORDER BY m.rowid DESC"
 
     fetch_limit = max(1, min(int(limit), 500))
     with _conn() as c:
         rows = [dict(r) for r in c.execute(
-            f"SELECT rowid, * FROM messages WHERE {where} {order} LIMIT ?",
+            f"SELECT m.rowid, m.* FROM messages_fts "
+            f"JOIN messages m ON m.rowid = messages_fts.rowid "
+            f"WHERE {where} {order} LIMIT ?",
             [*args, fetch_limit + 1],
         ).fetchall()]
 
