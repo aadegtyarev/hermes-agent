@@ -48,11 +48,31 @@ The work/read-only chat allowlist is ENV ∪ a runtime store: a bot operator lis
 TELEGRAM_ADMIN_USERS can enrol the current chat with a command — no file edits:
   /hermes_here      → add this chat as work (bot responds)
   /hermes_readonly  → add this chat as read-only (observe only)
-  /hermes_forget    → drop this chat from the runtime list
+  /hermes_forget    → drop this chat from the runtime list (or a program's team chat)
   /hermes_chats     → show the runtime list
 Commands are handled in the hook (before gating, so they work in a not-yet-enrolled
 chat), acknowledged via Bot API, and never forwarded to the agent. Commands reach the
 bot even with group privacy mode on (`/cmd@Bot`); full ingest still needs privacy off.
+
+A third chat mode, "client", generalizes beyond the journalist/partner use case
+this was built for (tech support/customer, or any "isolated one-on-one chat per
+outside party" pattern): dispatched like a work chat (same require_mention
+gating decides whether a turn fires — no extra anti-spam logic needed), but
+deliberately never calls add_dm_user()/auto-approves pairing, so membership in
+a client chat can never grant DM access. Registration is ``/hermes_program
+[name]`` — ONE command, contextual (see `_handle_hermes_program`):
+  - run in a fresh chat by a global admin, with a NEW name → creates a
+    "program" (e.g. "journalist-partners", "support-clients") bound to THIS
+    chat as that program's own team chat.
+  - run in a fresh chat, with an EXISTING program name (or auto-inferred from
+    the caller's own program membership when omitted and unambiguous) →
+    registers THIS chat as a client chat under that program. Open to anyone
+    who is a LIVE member of the program's team chat right now — no separate
+    admin list, mirroring the work-chat DM-auto-collection trust pattern.
+Cross-chat isolation for client-mode sessions (telegram_search/telegram_recent
+pinned to their own chat_id, session_search blocked, send_message restricted
+to their own chat) lives in `_pre_tool_call`, same mechanism as the read-only
+send-guard — see its docstring.
 
 For auto-collection to work, leave the gateway's own TELEGRAM_ALLOWED_USERS empty
 (this hook is the gate). Opt-in via plugins.enabled: [telegram-context] + toolset `telegram`.
@@ -95,8 +115,45 @@ def _readonly_chats() -> set[str]:
     return _csv("TELEGRAM_READONLY_CHATS") | _store_chats("readonly")
 
 
+def _client_chats() -> set[str]:
+    """Isolated client/partner chats — dynamic-only, no static env list.
+
+    Unlike work/readonly, a client chat is only ever created through
+    ``/hermes_program`` (registration requires live membership in some
+    program's team chat), never a static ``TELEGRAM_*_CHATS`` env var.
+    """
+    return _store_chats("client")
+
+
 def _admin_users() -> set[str]:
     return _csv("TELEGRAM_ADMIN_USERS")
+
+
+def _user_is_member_of_chat(uid: str, chat_id: str) -> bool:
+    """Live ``getChatMember`` check against one specific chat (not the work-chat loop).
+
+    Backs program trust: membership in a program's own team chat IS the
+    operator signal for that program (who can register client chats under
+    it, who counts as "an operator replied" for the batch reviewer) — no
+    separately-maintained admin list, mirroring how work-chat membership
+    already grants DM access elsewhere in this plugin.
+    """
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    if not token or not uid or not chat_id:
+        return False
+    try:
+        url = (f"https://api.telegram.org/bot{token}/getChatMember"
+               f"?chat_id={urllib.parse.quote(str(chat_id))}&user_id={uid}")
+        with urllib.request.urlopen(url, timeout=8) as r:
+            data = json.loads(r.read().decode())
+        return (data.get("result") or {}).get("status") in _MEMBER_STATUSES
+    except Exception:
+        return False
+
+
+def _programs_for_user(uid: str) -> list[str]:
+    """Which registered programs' team chats ``uid`` is currently a live member of."""
+    return [p for p, chat in store.programs().items() if _user_is_member_of_chat(uid, chat)]
 
 
 def _send(chat_id: str, text: str) -> None:
@@ -112,7 +169,12 @@ def _send(chat_id: str, text: str) -> None:
         logger.warning("telegram-context sendMessage failed: %s", e)
 
 
-_CHAT_COMMANDS = {"/hermes_here", "/hermes_readonly", "/hermes_forget", "/hermes_chats"}
+_CHAT_COMMANDS = {"/hermes_here", "/hermes_readonly", "/hermes_forget", "/hermes_chats", "/hermes_program"}
+# Gated on global TELEGRAM_ADMIN_USERS. /hermes_program is NOT in this set —
+# it has its own contextual auth (see _handle_hermes_program): creating a new
+# program still needs a global admin, but registering a client chat under an
+# EXISTING program only needs live membership in that program's own team chat.
+_GLOBAL_ADMIN_COMMANDS = {"/hermes_here", "/hermes_readonly", "/hermes_forget", "/hermes_chats"}
 
 # Menu descriptions for the /hermes_* admin commands. Registering them as plugin
 # slash commands makes them show up in Telegram's "/" menu (private chats — the
@@ -125,6 +187,7 @@ _MENU_COMMANDS = (
     ("hermes_readonly", "Сделать чат read-only (только наблюдение)"),
     ("hermes_forget", "Убрать этот чат из списка"),
     ("hermes_chats", "Показать список чатов"),
+    ("hermes_program", "Создать программу / зарегистрировать клиентский чат"),
 )
 
 
@@ -166,6 +229,70 @@ def _clear_group_command_menu() -> None:
         logger.warning("telegram-context: failed to clear group menu: %s", e)
 
 
+_HANDLED = {"action": "skip", "reason": "telegram chat command handled"}
+_NON_ADMIN_SILENT = {"action": "skip", "reason": "telegram chat command from non-admin"}
+
+
+def _handle_hermes_program(chat_id: str, uid: str, title: str, raw_text: str):
+    """Contextual ``/hermes_program [name]`` — one command, two jobs:
+
+    - ``<name>`` doesn't exist yet -> CREATE a new program bound to the
+      CURRENT chat as its team chat. Global-admin only (a new program is a
+      new trust root — rare, deliberate bootstrap).
+    - ``<name>`` already exists -> register the CURRENT chat as a CLIENT
+      chat under that program. Open to anyone who is a LIVE member of that
+      program's own team chat right now (no separate admin list to
+      maintain — membership in the team chat IS the authorization, same
+      pattern as work-chat DM auto-collection elsewhere in this plugin).
+    - no ``<name>`` given -> infer from the caller's own program membership:
+      exactly one -> register under it; several -> ask to disambiguate;
+      none (and not a global admin) -> silent no-op, same as any other
+      non-admin command misuse — never reveal the mechanism exists.
+
+    Replies (and this function at all) only ever fire inside a chat that is
+    either about to become registered or already is one of ours — never
+    leaking usage help into an unrelated chat.
+    """
+    if store.chat_mode(chat_id) or store.is_program_team_chat(chat_id):
+        _send(chat_id, "Этот чат уже зарегистрирован.")
+        return _HANDLED
+
+    parts = raw_text.split(maxsplit=1)
+    arg = parts[1].strip() if len(parts) > 1 else ""
+    progs = store.programs()
+
+    def _register_client(program_name: str) -> None:
+        store.set_chat(chat_id, "client", title, uid, program=program_name)
+        _send(chat_id, f"✅ Чат зарегистрирован как клиентский под программой «{program_name}».")
+        team_chat = progs.get(program_name) or store.program_chat_id(program_name)
+        _send(team_chat, f"➕ Добавлен новый клиентский чат под «{program_name}»: "
+              f"{title or chat_id} (добавил uid={uid}).")
+
+    if arg:
+        if arg in progs:
+            if not _user_is_member_of_chat(uid, progs[arg]):
+                return _NON_ADMIN_SILENT
+            _register_client(arg)
+            return _HANDLED
+        if uid not in _admin_users():
+            return _NON_ADMIN_SILENT
+        ok = store.create_program(arg, chat_id, uid)
+        _send(chat_id, f"✅ Программа «{arg}» создана — этот чат теперь её команда." if ok
+              else f"Не удалось создать «{arg}»: имя занято, или этот чат уже зарегистрирован.")
+        return _HANDLED
+
+    mine = _programs_for_user(uid)
+    if len(mine) == 1:
+        _register_client(mine[0])
+    elif len(mine) >= 2:
+        _send(chat_id, "Вы состоите в нескольких программах — укажите явно: /hermes_program <name>")
+    elif uid in _admin_users():
+        _send(chat_id, "Укажите имя новой программы: /hermes_program <name>")
+    else:
+        return _NON_ADMIN_SILENT
+    return _HANDLED
+
+
 def _handle_command(event, src, chat_id: str, uid: str):
     """If the message is a /hermes_* chat-admin command, act on it and return a skip
     action (so it isn't forwarded to the agent). Returns None if not a command."""
@@ -175,12 +302,16 @@ def _handle_command(event, src, chat_id: str, uid: str):
     cmd = text.split(maxsplit=1)[0].split("@", 1)[0].lower()  # strip @BotUsername
     if cmd not in _CHAT_COMMANDS:
         return None
+    title = getattr(src, "chat_name", "") or ""
+
+    if cmd == "/hermes_program":
+        return _handle_hermes_program(chat_id, uid, title, text)
+
     if uid not in _admin_users():
         # Silent ignore, no "⛔ not allowed" reply — a non-admin poking
         # /hermes_* shouldn't get any acknowledgement that the command
         # exists or was noticed at all.
-        return {"action": "skip", "reason": "telegram chat command from non-admin"}
-    title = getattr(src, "chat_name", "") or ""
+        return _NON_ADMIN_SILENT
     if cmd == "/hermes_here":
         store.set_chat(chat_id, "work", title, uid)
         _send(chat_id, "✅ Чат добавлен как рабочий — отвечаю здесь.")
@@ -188,18 +319,27 @@ def _handle_command(event, src, chat_id: str, uid: str):
         store.set_chat(chat_id, "readonly", title, uid)
         _send(chat_id, "👀 Чат добавлен как read-only — читаю для контекста, не отвечаю.")
     elif cmd == "/hermes_forget":
-        removed = store.remove_chat(chat_id)
-        _send(chat_id, "🗑 Чат убран из списка." if removed
-              else "Этого чата нет в динамическом списке (возможно, он задан через .env).")
+        removed_program = store.remove_program_by_chat(chat_id)
+        removed_chat = store.remove_chat(chat_id)
+        if removed_program:
+            _send(chat_id, f"🗑 Программа «{removed_program}» удалена (чат команды освобождён).")
+        elif removed_chat:
+            _send(chat_id, "🗑 Чат убран из списка.")
+        else:
+            _send(chat_id, "Этого чата нет в динамическом списке (возможно, он задан через .env).")
     elif cmd == "/hermes_chats":
         rows = store.list_chats()
-        if rows:
-            lines = [f"• {r['mode']}: {r['chat_id']}" + (f" — {r['title']}" if r.get("title") else "")
-                     for r in rows]
-            _send(chat_id, "Динамический список чатов:\n" + "\n".join(lines))
+        progs = store.programs()
+        lines = [f"• {r['mode']}: {r['chat_id']}"
+                 + (f" [{r['program']}]" if r.get("program") else "")
+                 + (f" — {r['title']}" if r.get("title") else "")
+                 for r in rows]
+        lines += [f"• program «{name}»: team chat {chat}" for name, chat in progs.items()]
+        if lines:
+            _send(chat_id, "Динамический список:\n" + "\n".join(lines))
         else:
             _send(chat_id, "Динамический список пуст (чаты также могут быть заданы через .env).")
-    return {"action": "skip", "reason": "telegram chat command handled"}
+    return _HANDLED
 
 
 def _ingest(event) -> None:
@@ -343,7 +483,7 @@ def _on_dispatch(event=None, gateway=None, session_store=None, **kwargs):
         if cmd_result is not None:
             return cmd_result
 
-        work, ro = _work_chats(), _readonly_chats()
+        work, ro, client = _work_chats(), _readonly_chats(), _client_chats()
 
         if ctype == "dm":
             _ingest(event)
@@ -359,10 +499,21 @@ def _on_dispatch(event=None, gateway=None, session_store=None, **kwargs):
                 store.add_dm_user(uid, getattr(src, "user_name", "") or "", chat_id)
                 _auto_approve_pairing(uid, getattr(src, "user_name", "") or "")
             return None
+        if chat_id in client:
+            # Isolated client/partner chat: ingested and dispatched exactly
+            # like a work chat (normal require_mention gating decides whether
+            # the turn actually fires — no extra spam-avoidance logic needed
+            # here), with ONE deliberate omission: no add_dm_user()/
+            # _auto_approve_pairing(). Being in a client chat must never grant
+            # DM access to the bot — this omission is the entire mechanism
+            # that enforces that. Cross-chat data/tool isolation for this
+            # mode is enforced separately in _pre_tool_call, not here.
+            _ingest(event)
+            return None
         if chat_id in ro:
             _ingest(event)
             return {"action": "skip", "reason": "read-only chat (observe only)"}
-        if not work and not ro:
+        if not work and not ro and not client:
             _ingest(event)     # unconfigured — don't lock out during setup
             return None
         return {"action": "skip", "reason": "chat not in TELEGRAM_WORK_CHATS/READONLY_CHATS"}
