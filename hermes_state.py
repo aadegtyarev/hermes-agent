@@ -4830,6 +4830,151 @@ class SessionDB:
 
         return matches
 
+    def get_chat_digest_page(
+        self,
+        *,
+        source: str,
+        chat_id: str,
+        thread_id: Optional[str] = None,
+        since_ts: Optional[float] = None,
+        until_ts: Optional[float] = None,
+        query: Optional[str] = None,
+        roles: Optional[List[str]] = None,
+        after_id: int = 0,
+        limit: int = 300,
+        count_only: bool = False,
+    ) -> Dict[str, Any]:
+        """Return one time-ordered, cursor-paginated page of a chat's messages.
+
+        Unlike :meth:`search_messages` (relevance-ranked FTS5 search across
+        every session), this walks a *specific* chat's history in
+        chronological order so a caller can build a topic report/digest over
+        an arbitrary time window without missing or double-counting rows —
+        the intended use is paging through weeks/months of a Telegram group's
+        transcript (including ``observed`` unmentioned-group messages, which
+        live in the same session row as the chat's triggered turns) in
+        bounded batches, since the full window is typically far larger than
+        any model's context.
+
+        ``query`` is a plain case-insensitive substring filter over
+        ``content`` (not FTS5 syntax) — a coarse topic pre-filter, not a
+        replacement for :meth:`search_messages`.
+
+        Pass ``count_only=True`` for a cheap upfront call that reports the
+        total matching row count / time span / approximate size without
+        fetching any content, so a caller can decide how to batch before
+        pulling data. Otherwise returns up to ``limit`` messages ordered by
+        ``id ASC`` starting after ``after_id``, plus ``has_more``/
+        ``next_cursor`` for the next page.
+        """
+        with self._lock:
+            session_rows = self._conn.execute(
+                "SELECT id FROM sessions WHERE source = ? AND chat_id = ?"
+                + (" AND thread_id = ?" if thread_id is not None else ""),
+                (source, str(chat_id))
+                + ((str(thread_id),) if thread_id is not None else ()),
+            ).fetchall()
+        session_ids = [row["id"] for row in session_rows]
+
+        if not session_ids:
+            if count_only:
+                return {
+                    "matched_sessions": 0,
+                    "total_count": 0,
+                    "oldest_ts": None,
+                    "newest_ts": None,
+                    "approx_chars": 0,
+                }
+            return {
+                "matched_sessions": 0,
+                "returned": 0,
+                "has_more": False,
+                "next_cursor": None,
+                "messages": [],
+            }
+
+        where_clauses = [
+            f"m.session_id IN ({','.join('?' for _ in session_ids)})",
+            "(m.active = 1 OR m.compacted = 1)",
+        ]
+        params: list = list(session_ids)
+
+        if not count_only:
+            where_clauses.append("m.id > ?")
+            params.append(after_id)
+        if since_ts is not None:
+            where_clauses.append("m.timestamp >= ?")
+            params.append(since_ts)
+        if until_ts is not None:
+            where_clauses.append("m.timestamp <= ?")
+            params.append(until_ts)
+        if roles:
+            where_clauses.append(f"m.role IN ({','.join('?' for _ in roles)})")
+            params.extend(roles)
+        if query:
+            where_clauses.append("m.content LIKE ? ESCAPE '\\'")
+            esc = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            params.append(f"%{esc}%")
+
+        where_sql = " AND ".join(where_clauses)
+
+        if count_only:
+            sql = f"""
+                SELECT COUNT(*) AS n, MIN(m.timestamp) AS oldest,
+                       MAX(m.timestamp) AS newest, SUM(LENGTH(m.content)) AS chars
+                FROM messages m
+                WHERE {where_sql}
+            """
+            with self._lock:
+                row = self._conn.execute(sql, params).fetchone()
+            return {
+                "matched_sessions": len(session_ids),
+                "total_count": row["n"] or 0,
+                "oldest_ts": row["oldest"],
+                "newest_ts": row["newest"],
+                "approx_chars": row["chars"] or 0,
+            }
+
+        fetch_limit = max(1, min(int(limit), 1000))
+        sql = f"""
+            SELECT m.id, m.role, m.content, m.timestamp, m.observed
+            FROM messages m
+            WHERE {where_sql}
+            ORDER BY m.id ASC
+            LIMIT ?
+        """
+        params.append(fetch_limit + 1)
+        with self._lock:
+            rows = [dict(r) for r in self._conn.execute(sql, params).fetchall()]
+
+        has_more = len(rows) > fetch_limit
+        rows = rows[:fetch_limit]
+
+        messages = []
+        for row in rows:
+            content = self._decode_content(row["content"])
+            if isinstance(content, list):
+                text_parts = [
+                    p.get("text", "") for p in content
+                    if isinstance(p, dict) and p.get("type") == "text"
+                ]
+                content = " ".join(t for t in text_parts if t).strip() or "[multimodal content]"
+            messages.append({
+                "id": row["id"],
+                "role": row["role"],
+                "content": content,
+                "timestamp": row["timestamp"],
+                "observed": bool(row["observed"]),
+            })
+
+        return {
+            "matched_sessions": len(session_ids),
+            "returned": len(messages),
+            "has_more": has_more,
+            "next_cursor": messages[-1]["id"] if has_more and messages else None,
+            "messages": messages,
+        }
+
     def search_sessions_by_id(
         self,
         query: str,
