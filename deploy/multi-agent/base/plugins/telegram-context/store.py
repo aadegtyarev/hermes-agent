@@ -33,6 +33,13 @@ def _conn() -> sqlite3.Connection:
     return c
 
 
+def _add_column_if_missing(c: sqlite3.Connection, table: str, column: str, decl: str) -> None:
+    """Idempotent ``ALTER TABLE ADD COLUMN`` for a table that predates the column."""
+    existing = {row[1] for row in c.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in existing:
+        c.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
+
 def init() -> None:
     with _LOCK, _conn() as c:
         c.execute(
@@ -112,21 +119,49 @@ def init() -> None:
                 user_id TEXT PRIMARY KEY, user_name TEXT, source_chat TEXT, added_ts REAL)"""
         )
         # Runtime chat allowlist: chats enrolled via admin commands (no file edits).
-        # mode ∈ {work, readonly}; unioned with the TELEGRAM_*_CHATS env at gate time.
+        # mode ∈ {work, readonly, client}; work/readonly unioned with the
+        # TELEGRAM_*_CHATS env at gate time. "client" chats (isolated
+        # per-partner/per-customer chats — see partner_programs below) carry a
+        # ``program`` tag; NULL for work/readonly.
         c.execute(
             """CREATE TABLE IF NOT EXISTS chats_allowed(
-                chat_id TEXT PRIMARY KEY, mode TEXT, title TEXT, added_by TEXT, added_ts REAL)"""
+                chat_id TEXT PRIMARY KEY, mode TEXT, title TEXT, added_by TEXT, added_ts REAL,
+                program TEXT)"""
+        )
+        _add_column_if_missing(c, "chats_allowed", "program", "TEXT")
+
+        # A "program" is a team's own chat (journalists, support engineers, ...)
+        # plus every "client" chat registered under it. Membership in the
+        # program's own chat_id IS the trust/operator signal — checked live via
+        # getChatMember, not a separately-maintained admin list (see
+        # _user_is_member_of_chat in __init__.py). One chat_id can be a
+        # program's team chat XOR a client chat, never both — enforced at the
+        # call sites in __init__.py, not here.
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS partner_programs(
+                program TEXT PRIMARY KEY, chat_id TEXT, created_by TEXT, created_ts REAL)"""
+        )
+
+        # Google Docs/Sheets links observed in a client chat's own messages —
+        # the ONLY documents that chat's session may ever open (see the
+        # gdoc pre_tool_call guard). Populated incrementally at ingest time,
+        # never pre-registered — a client chat may share several documents
+        # over its lifetime, and which ones matter isn't known at registration.
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS chat_doc_links(
+                chat_id TEXT, doc_id TEXT, first_seen_ts REAL, PRIMARY KEY(chat_id, doc_id))"""
         )
 
 
-def set_chat(chat_id: str, mode: str, title: str = "", added_by: str = "") -> None:
+def set_chat(chat_id: str, mode: str, title: str = "", added_by: str = "", program: str | None = None) -> None:
     import time
-    if not chat_id or mode not in ("work", "readonly"):
+    if not chat_id or mode not in ("work", "readonly", "client"):
         return
     with _LOCK, _conn() as c:
         c.execute(
-            "INSERT OR REPLACE INTO chats_allowed(chat_id,mode,title,added_by,added_ts) VALUES(?,?,?,?,?)",
-            (str(chat_id), mode, title, str(added_by), time.time()),
+            "INSERT OR REPLACE INTO chats_allowed(chat_id,mode,title,added_by,added_ts,program) "
+            "VALUES(?,?,?,?,?,?)",
+            (str(chat_id), mode, title, str(added_by), time.time(), program),
         )
 
 
@@ -143,10 +178,111 @@ def chats_by_mode(mode: str) -> set[str]:
                 c.execute("SELECT chat_id FROM chats_allowed WHERE mode=?", (mode,)).fetchall()}
 
 
+def chat_mode(chat_id: str) -> str | None:
+    """The registered mode (work/readonly/client) of chat_id, or None if unregistered."""
+    if not chat_id:
+        return None
+    with _conn() as c:
+        r = c.execute("SELECT mode FROM chats_allowed WHERE chat_id=?", (str(chat_id),)).fetchone()
+        return r["mode"] if r else None
+
+
+def chat_program(chat_id: str) -> str | None:
+    """The program a client chat is registered under, or None."""
+    if not chat_id:
+        return None
+    with _conn() as c:
+        r = c.execute(
+            "SELECT program FROM chats_allowed WHERE chat_id=? AND mode='client'", (str(chat_id),)
+        ).fetchone()
+        return r["program"] if r else None
+
+
 def list_chats() -> list[dict]:
     with _conn() as c:
         return [dict(r) for r in c.execute(
-            "SELECT chat_id,mode,title,added_by FROM chats_allowed ORDER BY added_ts DESC").fetchall()]
+            "SELECT chat_id,mode,title,added_by,program FROM chats_allowed ORDER BY added_ts DESC").fetchall()]
+
+
+# ── Programs: a team's own chat + every client chat registered under it ────
+
+
+def create_program(program: str, chat_id: str, created_by: str) -> bool:
+    """Bind ``program`` to ``chat_id`` as that program's team chat.
+
+    Returns False (no-op) if the program name is already taken, or if
+    ``chat_id`` is already registered as something else (a client chat, or
+    another program's team chat) — a chat is exactly one thing.
+    """
+    import time
+    if not program or not chat_id:
+        return False
+    with _LOCK, _conn() as c:
+        if c.execute("SELECT 1 FROM partner_programs WHERE program=?", (program,)).fetchone():
+            return False
+        if c.execute("SELECT 1 FROM partner_programs WHERE chat_id=?", (str(chat_id),)).fetchone():
+            return False
+        if c.execute("SELECT 1 FROM chats_allowed WHERE chat_id=?", (str(chat_id),)).fetchone():
+            return False
+        c.execute(
+            "INSERT INTO partner_programs(program,chat_id,created_by,created_ts) VALUES(?,?,?,?)",
+            (program, str(chat_id), str(created_by), time.time()),
+        )
+        return True
+
+
+def programs() -> dict[str, str]:
+    """{program_name: team_chat_id} for every registered program."""
+    with _conn() as c:
+        return {r["program"]: r["chat_id"] for r in c.execute(
+            "SELECT program, chat_id FROM partner_programs").fetchall()}
+
+
+def program_chat_id(program: str) -> str | None:
+    with _conn() as c:
+        r = c.execute("SELECT chat_id FROM partner_programs WHERE program=?", (program,)).fetchone()
+        return r["chat_id"] if r else None
+
+
+def is_program_team_chat(chat_id: str) -> bool:
+    if not chat_id:
+        return False
+    with _conn() as c:
+        return c.execute(
+            "SELECT 1 FROM partner_programs WHERE chat_id=?", (str(chat_id),)
+        ).fetchone() is not None
+
+
+def remove_program_by_chat(chat_id: str) -> str | None:
+    """Drop the program whose team chat is ``chat_id``. Returns its name, or None."""
+    if not chat_id:
+        return None
+    with _LOCK, _conn() as c:
+        r = c.execute("SELECT program FROM partner_programs WHERE chat_id=?", (str(chat_id),)).fetchone()
+        if not r:
+            return None
+        c.execute("DELETE FROM partner_programs WHERE chat_id=?", (str(chat_id),))
+        return r["program"]
+
+
+# ── Google Docs/Sheets links observed in a client chat ──────────────────────
+
+
+def link_chat_doc(chat_id: str, doc_id: str) -> None:
+    import time
+    if not chat_id or not doc_id:
+        return
+    with _LOCK, _conn() as c:
+        c.execute(
+            "INSERT OR IGNORE INTO chat_doc_links(chat_id,doc_id,first_seen_ts) VALUES(?,?,?)",
+            (str(chat_id), doc_id, time.time()),
+        )
+
+
+def chat_doc_ids(chat_id: str) -> set[str]:
+    with _conn() as c:
+        return {r["doc_id"] for r in c.execute(
+            "SELECT doc_id FROM chat_doc_links WHERE chat_id=?", (str(chat_id),)).fetchall()}
 
 
 def add_dm_user(user_id: str, user_name: str = "", source_chat: str = "") -> None:
