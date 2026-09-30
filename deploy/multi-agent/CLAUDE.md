@@ -18,16 +18,35 @@
 3. На сервере: `git pull --ff-only origin main`.
 4. Re-render + пересоздание (см. ниже).
 
-## Re-render (менялись agents.yaml / base/config.base.yaml)
-Под rootless `data/` и `config.yaml` принадлежат sub-UID (10001) — host `render.py`
-падает `PermissionError: .../data/skills`. Обязателен chown-танец (детали и точные
-команды — `SERVER-DEPLOY.md`, разделы про issue #12 и rw-config.yaml):
+## Redeploy — используй `bin/redeploy.sh`, не пляши вручную
+```bash
+deploy/multi-agent/bin/redeploy.sh gpio   # агент по умолчанию — gpio
 ```
-chown data+config -> 0:0  (через контейнер)   # отдать хосту
-python3 render.py
-chown data+config -> 10001:10001              # вернуть агенту
-docker compose ... up -d hermes-gpio
+Делает весь безопасный порядок разом: пересборка обоих образов (no-op, если
+код не менялся — кэш слоёв) → chown `data/`+`config.yaml` на `0:0` →
+`render.py` → chown обратно на `10001:10001` → `up -d` + безусловный
+`docker restart` (иначе content-only правка `config.yaml` не подхватится).
+Идемпотентен, можно гонять после **любого** изменения: код ядра, плагина,
+скилла, `agents.yaml`, `config.local.yaml` — один и тот же вызов.
+
+**Когда действительно нужен re-render** (не только agents.yaml/config.base.yaml!):
+любое изменение кода в `base/plugins/<name>/` или контента `base/skills/<name>/`
+— эти файлы копируются в `render/gpio/plugins/` и `instances/gpio/data/skills/`
+именно рендером, обычный `docker build` + рестарт их не обновит.
+
+**Обновление уже посеянного скилла** (`base/skills/<name>/` изменился, но
+скилл уже был засеян раньше — copy-IF-ABSENT его не тронет):
+```bash
+deploy/multi-agent/bin/refresh-skill.sh gpio telegram-guide research
 ```
+
+Пляска chown никуда не девается физически (у `render.py` два семейства
+файлов с разным владением под rootless — хостовые `docker-compose.generated.yml`/
+`render/` и sub-UID `data/`/`config.yaml`; свести к одному UID нельзя не
+ослабив изоляцию — см. пункт про `HERMES_UID=$(id -u)` ниже), но теперь она
+живёт внутри скрипта, а не в голове оператора. Точные команды — по-прежнему
+в `SERVER-DEPLOY.md` (issue #12 / rw-config.yaml) — читать, если сам скрипт
+падает и нужно разбираться руками.
 
 ## НЕ сноси `data/skills` — там накопленные агентские скиллы
 `instances/gpio/data/skills/` (`/opt/data/skills`, writable, gitignored) хранит
@@ -37,10 +56,11 @@ docker compose ... up -d hermes-gpio
 раздел «Откат / пересборка».
 
 ## Перечитать config.yaml
-`config.yaml` — бинд-маунт. Если менялся ТОЛЬКО он (например слаги моделей), а
-`docker-compose.generated.yml` — нет, то `up -d` покажет «Running» и НЕ пересоздаст
-контейнер. Чтобы применить новый конфиг → **`docker restart hermes-gpio`**
-(`restart` сохраняет proxy-env от прошлого `up`).
+`bin/redeploy.sh` уже делает безусловный `docker restart` после `up -d` именно
+по этой причине: `config.yaml` — бинд-маунт, и если менялся ТОЛЬКО он (например
+слаги моделей через `config.local.yaml`), `up -d` сам по себе покажет «Running»
+и НЕ пересоздаст контейнер. Руками так же: **`docker restart hermes-gpio`**
+(сохраняет proxy-env от прошлого `up`).
 
 ## Секреты (OPENAI_API_KEY и пр.)
 `.env` gitignored — реальные ключи живут ТОЛЬКО на сервере (`instances/gpio/.env`),
@@ -53,6 +73,18 @@ docker compose ... up -d hermes-gpio
 Сервер ходит наружу через корпоративный HTTP-прокси (`<proxy-host>:<port>`). `render.py` пробрасывает
 proxy-env в контейнер на момент `up`. Запускай `up -d` в шелле, где
 `HTTP_PROXY/HTTPS_PROXY` экспортированы (в SSH-профиле уже есть).
+
+## config.local.yaml может разойтись с реально работающей моделью
+`render.py` берёт `model`/`delegation`/`auxiliary` ЦЕЛИКОМ из
+`config.local.yaml` (полная замена секции, не merge) — если модель когда-то
+поменяли не через этот файл (руками в `config.yaml`, другим способом), то
+`bin/redeploy.sh`/`render.py` **тихо откатит** её обратно к тому, что записано
+в `config.local.yaml`. Перед редеплоем, если не уверен — сверь `model`/
+`delegation` в живом `/opt/data/config.yaml` (`docker exec hermes-gpio cat
+/opt/data/config.yaml`) с `instances/gpio/config.local.yaml`, прежде чем
+рендерить. Так уже случалось (30.09.2026) — модель откатилась с `gpt-6-luna`/
+`gpt-5.6-sol` на `gpt-5.4` при обычном редеплое; пришлось восстанавливать
+вручную.
 
 ## Диагностика падений
 `docker logs --tail 80 hermes-gpio`. Частые причины:
