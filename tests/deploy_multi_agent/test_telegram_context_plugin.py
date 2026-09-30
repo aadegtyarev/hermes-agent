@@ -329,6 +329,26 @@ def test_ensure_batch_review_cron_job_registers_once_scoped_to_its_own_toolset(p
     assert len(still_one) == 1
 
 
+def test_dedupe_cron_jobs_keeps_only_the_oldest(plugin):
+    """Regression guard: a real production incident — two near-simultaneous
+    register() calls both saw "not yet registered" before either create()
+    call had persisted, producing two jobs with the same name. Belt-and-
+    suspenders cleanup so a race this plugin load hit self-heals on the
+    next one, regardless of exactly how the race happened."""
+    pytest.importorskip("croniter")
+    from cron import jobs as cron_jobs
+
+    older = cron_jobs.create_job(prompt="test job", schedule="0 3 * * *", name="dupe-test")
+    newer = cron_jobs.create_job(prompt="test job", schedule="0 3 * * *", name="dupe-test")
+    assert older["id"] != newer["id"]
+
+    plugin._dedupe_cron_jobs_by_name(cron_jobs, "dupe-test")
+
+    remaining = [j for j in cron_jobs.list_jobs(include_disabled=True) if j.get("name") == "dupe-test"]
+    assert len(remaining) == 1
+    assert remaining[0]["id"] == older["id"]
+
+
 # ── Client-chat isolation: telegram_search/telegram_recent/session_search/
 # send_message must all be pinned to (or blocked outside of) a client chat's
 # own history — the one-directional guarantee described in _pre_tool_call's
