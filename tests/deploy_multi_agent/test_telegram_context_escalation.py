@@ -213,3 +213,63 @@ def test_deep_link_defaults_message_id_to_one(plugin):
 
 def test_deep_link_none_for_a_basic_group_id(plugin):
     assert plugin._telegram_chat_deep_link("-700") is None
+
+
+# ── partner_flag_chats: the batch reviewer's own tool ───────────────────────
+# Same _escalate_chat core as escalate_to_team, reached via explicit chat_ids
+# instead of the caller's own session — used by the batch-review cron job,
+# which has no single "origin chat" of its own.
+
+def test_flag_chats_escalates_each_valid_entry(plugin):
+    _setup_client_chat(plugin, client_chat="-700", team_chat="-500")
+    _setup_client_chat(plugin, client_chat="-701", team_chat="-500")
+
+    result = json.loads(plugin.T.handle_partner_flag_chats({"flags": [
+        {"chat_id": "-700", "reason": "partner sent photos from the site"},
+        {"chat_id": "-701", "reason": "partner asking about timeline"},
+    ]}))
+
+    assert result["count"] == 2
+    assert all(r["escalated"] for r in result["results"])
+    assert len(plugin._TEST_SENT) == 2
+    assert {s["chat_id"] for s in plugin._TEST_SENT} == {"-500"}
+
+
+def test_flag_chats_rejects_a_chat_id_that_isnt_a_registered_client_chat(plugin):
+    """Defense in depth: even if the model hallucinated a chat_id not present
+    in the script's own digest, the server-side chat_mode check refuses it —
+    this must never be able to reach an arbitrary chat."""
+    result = json.loads(plugin.T.handle_partner_flag_chats({"flags": [
+        {"chat_id": "-999999", "reason": "made up"},
+    ]}))
+
+    assert result["results"][0]["ok"] is False
+    assert plugin._TEST_SENT == []
+
+
+def test_flag_chats_respects_the_same_cooldown_as_escalate_to_team(plugin, resolved_session):
+    _setup_client_chat(plugin)
+    plugin.T.handle_escalate_to_team({"message": "first"}, session_id=resolved_session)
+
+    result = json.loads(plugin.T.handle_partner_flag_chats({"flags": [
+        {"chat_id": "-700", "reason": "second, too soon"},
+    ]}))
+
+    assert result["results"][0]["escalated"] is False
+    assert result["results"][0]["reason"] == "cooldown"
+    assert len(plugin._TEST_SENT) == 1  # the flag call never actually sent
+
+
+def test_flag_chats_skips_entries_missing_chat_id_or_reason(plugin):
+    result = json.loads(plugin.T.handle_partner_flag_chats({"flags": [
+        {"chat_id": "-700"},
+        {"reason": "no chat id given"},
+    ]}))
+
+    assert all(r["ok"] is False for r in result["results"])
+    assert plugin._TEST_SENT == []
+
+
+def test_flag_chats_rejects_non_list_flags(plugin):
+    result = json.loads(plugin.T.handle_partner_flag_chats({"flags": "not-a-list"}))
+    assert "error" in result
