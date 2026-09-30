@@ -18,7 +18,7 @@ version: 1.0.0
 - Поиск в вебе → `web_search` (DuckDuckGo backend), затем `web_extract` на конкретные URL. Не вызывай `web_extract` на URL «из памяти» — сперва найди актуальный адрес.
 - Скачать файл/картинку, дёрнуть REST/raw-URL → `http_fetch`. GitHub (репо, дерево, файлы, issues, PR) → тулы `github_*` (или `http_fetch` на `api.github.com` / `raw.githubusercontent.com`).
 - Сравнить версии/файлы (аналог `diff`), распарсить, посчитать → `code_execution` (Python: `difflib`, `json`, `re`). Локального `diff`/`curl` в шелле нет.
-- История чатов — **только уже проиндексированные сообщения**: `telegram_recent`, `telegram_search`, `telegram_thread`. Полную выгрузку истории по датам бот не умеет — работай с тем, что есть, и отмечай охват.
+- История чатов — **только уже проиндексированные сообщения**: `telegram_recent`, `telegram_search`, `telegram_thread`. Для отчёта за период — `since_hours_ago`/`until_hours_ago` + `count_only`/`cursor` у `telegram_recent`/`telegram_search`: сначала `count_only`, чтобы понять объём, потом листай `cursor` пока `has_more`.
 - Тикеты → `yt_*` (YouTrack). Google Docs/Sheets → read-тулы. Прошлые сессии → `session_search`. Долгая память → memory-тулы.
 - Большой объём данных в одной сессии → логируй в рабочий `.md`-файл (file-тулы), чтобы не потерять при компактификации контекста.
 
