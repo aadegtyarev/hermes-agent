@@ -65,6 +65,67 @@ async def test_send_short_circuits_when_path_degraded():
 
 
 @pytest.mark.asyncio
+async def test_send_short_circuits_for_read_only_chat():
+    """A chat_id in telegram.read_only_chats never reaches the Bot API,
+    regardless of what triggered the send (reply, cron delivery, background
+    notification, ...) — the hard code-level no-write guarantee."""
+    adapter = TelegramAdapter(
+        PlatformConfig(enabled=True, token="***", extra={"read_only_chats": ["123"]})
+    )
+    adapter._bot = MagicMock()
+    adapter._bot.send_message = AsyncMock(return_value=MagicMock(message_id=42))
+
+    result = await adapter.send("123", "hello")
+
+    assert result.success is False
+    assert result.error == "chat_is_read_only"
+    assert result.retryable is False
+    adapter._bot.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_send_unaffected_for_chat_not_marked_read_only():
+    adapter = TelegramAdapter(
+        PlatformConfig(enabled=True, token="***", extra={"read_only_chats": ["999"]})
+    )
+    adapter._bot = MagicMock()
+    adapter._bot.send_message = AsyncMock(return_value=MagicMock(message_id=42))
+
+    result = await adapter.send("123", "hello")
+
+    assert result.success is True
+    adapter._bot.send_message.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_edit_message_short_circuits_for_read_only_chat():
+    adapter = TelegramAdapter(
+        PlatformConfig(enabled=True, token="***", extra={"read_only_chats": ["123"]})
+    )
+    adapter._bot = MagicMock()
+    adapter._bot.edit_message_text = AsyncMock()
+
+    result = await adapter.edit_message("123", "42", "hello")
+
+    assert result.success is False
+    assert result.error == "chat_is_read_only"
+    adapter._bot.edit_message_text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_send_typing_short_circuits_for_read_only_chat():
+    adapter = TelegramAdapter(
+        PlatformConfig(enabled=True, token="***", extra={"read_only_chats": ["123"]})
+    )
+    adapter._bot = MagicMock()
+    adapter._bot.send_chat_action = AsyncMock()
+
+    await adapter.send_typing("123")
+
+    adapter._bot.send_chat_action.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_reconnect_storm_sets_and_heartbeat_clears_flag(monkeypatch):
     """_handle_polling_network_error sets the flag while reconnecting; if the
     reconnect attempt itself raises (polling not yet healthy), the flag stays

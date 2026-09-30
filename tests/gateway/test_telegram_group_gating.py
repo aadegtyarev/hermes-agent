@@ -21,6 +21,7 @@ def _make_adapter(
     group_allowed_chats=None,
     guest_mode=None,
     observe_unmentioned_group_messages=None,
+    read_only_chats=None,
     bot_username="hermes_bot",
 ):
     from plugins.platforms.telegram.adapter import TelegramAdapter
@@ -62,6 +63,8 @@ def _make_adapter(
         extra["guest_mode"] = guest_mode
     if observe_unmentioned_group_messages is not None:
         extra["observe_unmentioned_group_messages"] = observe_unmentioned_group_messages
+    if read_only_chats is not None:
+        extra["read_only_chats"] = read_only_chats
 
     adapter = object.__new__(TelegramAdapter)
     adapter.platform = Platform.TELEGRAM
@@ -410,6 +413,64 @@ def test_unmentioned_group_observe_respects_chat_allowlist():
         assert store.messages == []
 
     asyncio.run(_run())
+
+
+def test_read_only_chat_never_dispatches_even_on_direct_mention():
+    """A read-only chat must not reply even to an explicit @mention — the
+    trigger-gate half of the hard no-write guarantee (see send()'s own
+    guard for the other half)."""
+    text = "hi @hermes_bot"
+    adapter = _make_adapter(require_mention=True, read_only_chats=["-300"])
+
+    assert adapter._should_process_message(
+        _group_message(text, chat_id=-300, entities=[_mention_entity(text)])
+    ) is False
+    assert adapter._should_process_message(
+        _group_message("replying", chat_id=-300, reply_to_bot=True)
+    ) is False
+
+
+def test_read_only_chat_is_self_sufficient_for_observation():
+    """read_only_chats alone — no group_allowed_chats/allowed_chats/
+    observe_unmentioned_group_messages needed — captures every message,
+    including ones that mention the bot, since those can never dispatch."""
+    async def _run():
+        adapter = _make_adapter(require_mention=True, read_only_chats=["-300"])
+        store = _FakeSessionStore()
+        adapter._session_store = store
+        text = "hi @hermes_bot, what happened today?"
+        update = SimpleNamespace(
+            update_id=2001,
+            message=_group_message(text, chat_id=-300, entities=[_mention_entity(text)]),
+            effective_message=None,
+        )
+
+        await adapter._handle_text_message(update, SimpleNamespace())
+
+        adapter._message_handler.assert_not_awaited()
+        assert len(store.messages) == 1
+        _, stored_message, _ = store.messages[0]
+        assert stored_message["observed"] is True
+
+    asyncio.run(_run())
+
+
+def test_read_only_chats_take_priority_over_free_response_chats():
+    """A chat_id misconfigured in both lists must stay silent — read-only
+    always wins."""
+    adapter = _make_adapter(
+        require_mention=True,
+        read_only_chats=["-300"],
+        free_response_chats=["-300"],
+    )
+
+    assert adapter._should_process_message(_group_message("hello everyone", chat_id=-300)) is False
+
+
+def test_chats_outside_read_only_list_are_unaffected():
+    adapter = _make_adapter(require_mention=False, read_only_chats=["-300"])
+
+    assert adapter._should_process_message(_group_message("hello everyone", chat_id=-100)) is True
 
 
 class _FakeSessionEntry:
