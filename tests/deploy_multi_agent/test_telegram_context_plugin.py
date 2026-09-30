@@ -434,3 +434,90 @@ def test_isolation_guards_no_op_without_a_resolvable_session(plugin, fake_sessio
     assert plugin._pre_tool_call(
         tool_name="telegram_search", args={"query": "hello"},
     ) is None  # no session_id kwarg at all
+
+
+# ── Google Docs isolation: gdoc_read/gdoc_comments pinned to chat_doc_links,
+# gdrive_search blocked outright, for client-mode sessions only ────────────
+
+def test_link_chat_docs_extracts_doc_id_from_ingested_text(plugin):
+    plugin._link_chat_docs(
+        "-700", "please review https://docs.google.com/document/d/DOC123abc/edit?tab=t.0"
+    )
+    assert plugin.store.chat_doc_ids("-700") == {"DOC123abc"}
+
+
+def test_link_chat_docs_ignores_text_with_no_gdoc_link(plugin):
+    plugin._link_chat_docs("-700", "just a normal message, no links here")
+    assert plugin.store.chat_doc_ids("-700") == set()
+
+
+def test_ingest_populates_chat_doc_links_from_a_real_message(plugin):
+    msg = _group_message(
+        "here's the draft: https://docs.google.com/document/d/DOC999/edit",
+        chat_id="-700",
+    )
+    plugin._ingest(msg)
+    assert plugin.store.chat_doc_ids("-700") == {"DOC999"}
+
+
+def test_gdoc_read_blocked_for_a_doc_never_shared_in_this_client_chat(plugin, fake_session_db):
+    _client_session(plugin, fake_session_db, "sess-1", "-700")
+
+    result = plugin._pre_tool_call(
+        tool_name="gdoc_read", args={"url": "https://docs.google.com/document/d/UNSEEN/edit"},
+        session_id="sess-1",
+    )
+
+    assert result is not None and result["action"] == "block"
+
+
+def test_gdoc_read_allowed_for_a_doc_the_chat_actually_shared(plugin, fake_session_db):
+    _client_session(plugin, fake_session_db, "sess-1", "-700")
+    plugin.store.link_chat_doc("-700", "SEEN123")
+
+    result = plugin._pre_tool_call(
+        tool_name="gdoc_read", args={"url": "https://docs.google.com/document/d/SEEN123/edit"},
+        session_id="sess-1",
+    )
+
+    assert result is None
+
+
+def test_gdoc_comments_same_scoping_as_gdoc_read(plugin, fake_session_db):
+    _client_session(plugin, fake_session_db, "sess-1", "-700")
+    plugin.store.link_chat_doc("-700", "SEEN123")
+
+    blocked = plugin._pre_tool_call(
+        tool_name="gdoc_comments", args={"url": "UNSEEN"}, session_id="sess-1",
+    )
+    allowed = plugin._pre_tool_call(
+        tool_name="gdoc_comments", args={"url": "SEEN123"}, session_id="sess-1",
+    )
+
+    assert blocked is not None and blocked["action"] == "block"
+    assert allowed is None
+
+
+def test_gdrive_search_fully_blocked_from_client_chat(plugin, fake_session_db):
+    _client_session(plugin, fake_session_db, "sess-1", "-700")
+
+    result = plugin._pre_tool_call(
+        tool_name="gdrive_search", args={"query": "budget"}, session_id="sess-1",
+    )
+
+    assert result is not None and result["action"] == "block"
+
+
+def test_gdoc_tools_unaffected_from_work_chats(plugin, fake_session_db):
+    """Regression guard: the whole Drive stays reachable from a work chat,
+    matching the same one-directional isolation as the other guards."""
+    plugin.store.set_chat("-800", "work", "", "111")
+    fake_session_db._SESSIONS["sess-2"] = "-800"
+
+    assert plugin._pre_tool_call(
+        tool_name="gdrive_search", args={"query": "anything"}, session_id="sess-2",
+    ) is None
+    assert plugin._pre_tool_call(
+        tool_name="gdoc_read", args={"url": "https://docs.google.com/document/d/ANY/edit"},
+        session_id="sess-2",
+    ) is None
