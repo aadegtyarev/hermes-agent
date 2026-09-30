@@ -737,6 +737,7 @@ def _ensure_backup_cron_job() -> None:
         dest.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
 
         if any(j.get("name") == _BACKUP_JOB_NAME for j in cron_jobs.list_jobs(include_disabled=True)):
+            _dedupe_cron_jobs_by_name(cron_jobs, _BACKUP_JOB_NAME)
             return
 
         cron_jobs.create_job(
@@ -747,6 +748,7 @@ def _ensure_backup_cron_job() -> None:
             no_agent=True,
         )
         logger.info("telegram-context: registered nightly telegram.db backup cron job")
+        _dedupe_cron_jobs_by_name(cron_jobs, _BACKUP_JOB_NAME)
     except Exception as e:  # noqa: BLE001
         logger.warning("telegram-context: failed to register backup cron job: %s", e)
 
@@ -765,6 +767,34 @@ _BATCH_REVIEW_PROMPT = (
     "exactly \"[SILENT]\" — delivery already happened via the tool call, "
     "there is nothing else to report."
 )
+
+
+def _dedupe_cron_jobs_by_name(cron_jobs, name: str) -> None:
+    """Keep only the oldest job named ``name``, removing any extras.
+
+    Belt-and-suspenders against a TOCTOU race in the create-if-absent pattern
+    both cron jobs in this plugin use: two near-simultaneous register() calls
+    (observed in production — two plugin loads within 7ms of each other at
+    container start both saw "not yet registered" before either create()
+    call had persisted) can both pass the "does it exist?" check and both
+    create a job. Harmless functionally (the second job's own due-chat
+    filtering finds nothing new once the first has already run that tick),
+    but wasteful — call this right after create_job() so a race this plugin
+    load hit gets cleaned up on the NEXT load rather than accumulating.
+    """
+    try:
+        jobs = sorted(
+            (j for j in cron_jobs.list_jobs(include_disabled=True) if j.get("name") == name),
+            key=lambda j: j.get("created_at") or "",
+        )
+        for extra in jobs[1:]:
+            cron_jobs.remove_job(extra["id"])
+            logger.warning(
+                "telegram-context: removed duplicate cron job %r (id=%s) — "
+                "a race created more than one", name, extra["id"],
+            )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("telegram-context: cron job dedupe check failed for %r: %s", name, e)
 
 
 def _ensure_batch_review_cron_job() -> None:
@@ -789,6 +819,7 @@ def _ensure_batch_review_cron_job() -> None:
         dest.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
 
         if any(j.get("name") == _BATCH_REVIEW_JOB_NAME for j in cron_jobs.list_jobs(include_disabled=True)):
+            _dedupe_cron_jobs_by_name(cron_jobs, _BATCH_REVIEW_JOB_NAME)
             return
 
         cron_jobs.create_job(
@@ -800,6 +831,7 @@ def _ensure_batch_review_cron_job() -> None:
             deliver="local",
         )
         logger.info("telegram-context: registered client-chat batch-review cron job")
+        _dedupe_cron_jobs_by_name(cron_jobs, _BATCH_REVIEW_JOB_NAME)
     except Exception as e:  # noqa: BLE001
         logger.warning("telegram-context: failed to register batch-review cron job: %s", e)
 
