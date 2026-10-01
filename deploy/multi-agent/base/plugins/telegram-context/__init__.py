@@ -678,6 +678,43 @@ def _pre_tool_call(tool_name=None, args=None, **kwargs):
         # isn't in it — blocked for a client-chat session the same as any
         # other non-allowlisted tool, no special case needed here).
 
+    if tool_name == "cronjob" and str((args or {}).get("action") or "").strip().lower() in ("create", "update"):
+        # cron delivery does NOT go through this hook at all — cron/
+        # scheduler.py's _deliver_result calls tools.send_message_tool's
+        # internal _send_to_platform directly when a job fires, completely
+        # bypassing handle_function_call (and therefore pre_tool_call) since
+        # nothing about firing a scheduled job is a model tool call. The
+        # send_message guard above only ever sees a target at the moment the
+        # MODEL calls send_message — it cannot catch "schedule a job whose
+        # deliver fires into a read-only chat an hour from now", in a work
+        # chat or any other non-client session, not just a client one. The
+        # only enforcement point available without a core change is here, at
+        # job CREATION/UPDATE time — this cannot catch a chat that becomes
+        # read-only AFTER a job targeting it already exists (no hook fires on
+        # delivery itself to re-check), only stops a NEW job from being
+        # pointed at an already-read-only chat.
+        readonly = _readonly_chats()
+        deliver = str((args or {}).get("deliver") or "").strip()
+        for piece in deliver.split(","):
+            piece = piece.strip()
+            if piece.lower() == "all" and readonly:
+                return {
+                    "action": "block",
+                    "message": "deliver='all' fans out to every connected channel, including "
+                               "read-only chats — this bot never writes there. Name specific "
+                               "non-read-only targets instead.",
+                }
+            m = _TELEGRAM_TARGET_CHAT_RE.match(piece)
+            if not m:
+                continue
+            piece_chat_id = m.group(1) or os.environ.get("TELEGRAM_HOME_CHANNEL", "").strip()
+            if piece_chat_id and piece_chat_id in readonly:
+                return {
+                    "action": "block",
+                    "message": f"Chat {piece_chat_id} is read-only — this bot never writes there, "
+                               "including via a scheduled cron delivery. Pick a different target.",
+                }
+
     origin_chat = store.origin_chat_id(kwargs.get("session_id") or "")
     if not origin_chat or store.chat_mode(origin_chat) != "client":
         return None  # not a confirmed client-chat session — no restriction
