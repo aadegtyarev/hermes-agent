@@ -67,10 +67,14 @@ def _text_from_body(body: dict, mark_suggestions: bool = False) -> str:
                 continue
             content = run["content"]
             if mark_suggestions:
+                # Independent checks, not elif: a run proposed for deletion by
+                # one suggester and insertion by another (replace-by-suggestion)
+                # carries both id lists — reporting only one would hide half
+                # of what's actually pending.
+                if run.get("suggestedDeletionIds"):
+                    content = f"⟪-{content}⟫"
                 if run.get("suggestedInsertionIds"):
                     content = f"⟪+{content}⟫"
-                elif run.get("suggestedDeletionIds"):
-                    content = f"⟪-{content}⟫"
             out.append(content)
     return "".join(out)
 
@@ -171,15 +175,19 @@ def handle_gdoc_read(args: dict, **kw) -> str:
         # suggestionsViewMode=SUGGESTIONS_INLINE keeps pending suggestions in
         # the response (with suggestedInsertionIds/suggestedDeletionIds on
         # their text runs) instead of previewing as already-accepted/rejected.
-        doc = (
-            svc.documents()
-            .get(
-                documentId=doc_id,
-                includeTabsContent=True,
-                suggestionsViewMode="SUGGESTIONS_INLINE",
-            )
-            .execute()
-        )
+        #
+        # Passed ONLY when actually requested: per the Docs API's
+        # SuggestionsViewMode reference, SUGGESTIONS_INLINE returns an error
+        # for a caller who only has view-only access to the document (no
+        # permission to see suggested changes) — a real regression on the
+        # default, non-opt-in path if sent unconditionally. Omitting the
+        # param falls back to DEFAULT_FOR_CURRENT_ACCESS, which degrades
+        # gracefully for a viewer the same way this tool always behaved
+        # before include_suggestions existed.
+        get_kwargs = {"documentId": doc_id, "includeTabsContent": True}
+        if mark_suggestions:
+            get_kwargs["suggestionsViewMode"] = "SUGGESTIONS_INLINE"
+        doc = svc.documents().get(**get_kwargs).execute()
     except Exception as e:
         return tool_error(f"Failed to read Google Doc {doc_id}: {e}")
     text, tabs = _text_from_doc(doc, mark_suggestions=mark_suggestions)
@@ -409,26 +417,35 @@ def handle_gdoc_comments(args: dict, **kw) -> str:
             "Pass 'url' as a Google Docs link (…/document/d/<ID>/…) or a bare document id."
         )
     include_resolved = bool(args.get("include_resolved"))
+    _MAX_PAGES = 10  # 10 * 100 = 1000 comments — a sane upper bound, not a real limit
+    raw_comments: list[dict] = []
     try:
         svc = _gauth.service("drive", "v3", DRIVE_SCOPES)
-        resp = (
-            svc.comments()
-            .list(
-                fileId=doc_id,
-                fields=(
+        page_token = None
+        for _ in range(_MAX_PAGES):
+            list_kwargs = {
+                "fileId": doc_id,
+                "pageSize": 100,
+                "fields": (
+                    "nextPageToken,"
                     "comments(id,content,author(displayName),createdTime,"
                     "resolved,quotedFileContent(value),"
                     "replies(content,author(displayName),createdTime))"
                 ),
-                includeDeleted=False,
-            )
-            .execute()
-        )
+                "includeDeleted": False,
+            }
+            if page_token:
+                list_kwargs["pageToken"] = page_token
+            resp = svc.comments().list(**list_kwargs).execute()
+            raw_comments.extend(resp.get("comments", []) or [])
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
     except Exception as e:
         return tool_error(f"Failed to read comments for {doc_id}: {e}")
 
     comments = []
-    for c in resp.get("comments", []) or []:
+    for c in raw_comments:
         if c.get("resolved") and not include_resolved:
             continue
         comments.append({

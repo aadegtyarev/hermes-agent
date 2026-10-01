@@ -113,9 +113,27 @@ def test_unmarked_runs_unaffected_by_suggestion_mode(tools_mod):
     assert tools_mod._text_from_body(body, mark_suggestions=True) == "plain text, nothing pending"
 
 
+def test_run_with_both_insertion_and_deletion_ids_marks_both(tools_mod):
+    """A run proposed for deletion by one suggester and insertion by another
+    (replace-by-suggestion) carries BOTH id lists — reporting only one
+    (the original code used elif) would silently hide half of what's
+    actually pending review."""
+    body = _body_with_runs({
+        "content": "replaced text",
+        "suggestedInsertionIds": ["s1"],
+        "suggestedDeletionIds": ["s2"],
+    })
+    result = tools_mod._text_from_body(body, mark_suggestions=True)
+    assert "⟪-" in result and "⟪+" in result and "replaced text" in result
+
+
 # ── handle_gdoc_read: suggestionsViewMode wiring ────────────────────────────
 
-def test_gdoc_read_requests_suggestions_inline_view_mode(tools_mod, monkeypatch):
+def test_gdoc_read_requests_suggestions_inline_view_mode_only_when_asked(tools_mod, monkeypatch):
+    """suggestionsViewMode must be OMITTED by default, not sent as
+    SUGGESTIONS_INLINE unconditionally — the Docs API returns an error for
+    that mode when the caller only has view-only access to the document, a
+    real regression on the default (non-opt-in) read path if sent always."""
     fake_docs = MagicMock()
     fake_docs.documents().get().execute.return_value = {
         "title": "Draft",
@@ -124,7 +142,10 @@ def test_gdoc_read_requests_suggestions_inline_view_mode(tools_mod, monkeypatch)
     monkeypatch.setattr(tools_mod._gauth, "service", lambda *a, **k: fake_docs)
 
     tools_mod.handle_gdoc_read({"url": "abc123"})
+    _, kwargs = fake_docs.documents().get.call_args
+    assert "suggestionsViewMode" not in kwargs
 
+    tools_mod.handle_gdoc_read({"url": "abc123", "include_suggestions": True})
     _, kwargs = fake_docs.documents().get.call_args
     assert kwargs.get("suggestionsViewMode") == "SUGGESTIONS_INLINE"
 
@@ -224,3 +245,40 @@ def test_gdoc_comments_missing_url_is_an_error(tools_mod):
 
     result = json.loads(tools_mod.handle_gdoc_comments({}))
     assert "error" in result
+
+
+def test_gdoc_comments_follows_pagination(tools_mod, monkeypatch):
+    """Drive v3 comments.list defaults to a small page size — a doc with
+    more open threads than one page was silently truncated with no
+    indication before this fix."""
+    import json
+
+    page1 = {"nextPageToken": "page2",
+             "comments": [{"id": "c1", "content": "first page", "resolved": False, "author": {}, "replies": []}]}
+    page2 = {"comments": [{"id": "c2", "content": "second page", "resolved": False, "author": {}, "replies": []}]}
+
+    fake_drive = MagicMock()
+    fake_drive.comments().list().execute.side_effect = [page1, page2]
+    monkeypatch.setattr(tools_mod._gauth, "service", lambda *a, **k: fake_drive)
+
+    result = json.loads(tools_mod.handle_gdoc_comments({"url": "abc123"}))
+
+    assert result["count"] == 2
+    assert {c["id"] for c in result["comments"]} == {"c1", "c2"}
+
+
+def test_gdoc_comments_pagination_is_bounded(tools_mod, monkeypatch):
+    """An endless nextPageToken (buggy/malicious API response) must not hang
+    the tool forever — capped at _MAX_PAGES."""
+    import json
+
+    def _always_more(*a, **k):
+        return {"nextPageToken": "more", "comments": []}
+
+    fake_drive = MagicMock()
+    fake_drive.comments().list().execute.side_effect = _always_more
+    monkeypatch.setattr(tools_mod._gauth, "service", lambda *a, **k: fake_drive)
+
+    result = json.loads(tools_mod.handle_gdoc_comments({"url": "abc123"}))
+
+    assert result["count"] == 0  # terminates instead of hanging

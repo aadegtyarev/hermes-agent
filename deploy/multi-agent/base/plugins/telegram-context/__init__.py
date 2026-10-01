@@ -410,23 +410,43 @@ def _handle_command(event, src, chat_id: str, uid: str):
     return _HANDLED
 
 
-_GDOC_LINK_RE = re.compile(r"https?://docs\.google\.com/document/d/([a-zA-Z0-9_-]+)")
+_GDOC_LINK_RE = re.compile(r"(?:https?://)?docs\.google\.com/document/d/([a-zA-Z0-9_-]+)")
 
 
-def _link_chat_docs(chat_id: str, text: str) -> None:
-    """Record any Google Docs links seen in a chat's own message text.
+def _link_chat_docs(chat_id: str, text: str, uid: str = "") -> None:
+    """Record Google Docs links POSTED BY A CONFIRMED TEAM MEMBER of a client
+    chat's own program — the ONLY source of truth for "which documents may
+    gdoc_read touch from this chat" (see the isolation guard in
+    _pre_tool_call). Populated incrementally as links are actually shared,
+    never pre-registered at chat-registration time (a client chat may share
+    several documents over its lifetime; which ones matter isn't known up
+    front).
 
-    The ONLY source of truth for "which documents may gdoc_read touch from
-    this chat" (see the isolation guard in _pre_tool_call) — populated
-    incrementally as links are actually shared, never pre-registered at
-    chat-registration time (a client chat may share several documents over
-    its lifetime; which ones matter isn't known up front). Cheap and
-    unconditional: runs for every ingested message regardless of chat mode,
-    since the data only matters when read back for a client-mode chat.
+    The team-membership check matters: an EARLIER version linked whatever
+    doc_id appeared in ANY message regardless of sender, which let the
+    untrusted partner themselves grant gdoc_read access to an arbitrary
+    internal document just by pasting its link into their own chat — the
+    bot would then open it with the TEAM's Drive credentials. Only a
+    confirmed live member of the chat's own program's team chat can add a
+    document to the allowlist; a partner-posted link to even a genuinely
+    legitimate shared document is simply not auto-trusted (the team member
+    re-sharing it, or using escalate_to_team, re-establishes trust).
+
+    For a non-client chat (work/readonly), chat_program() is None and links
+    are recorded unconditionally as before — harmless (the isolation guard
+    only ever reads chat_doc_links for client-mode chats).
     """
     if not chat_id or not text:
         return
-    for m in _GDOC_LINK_RE.finditer(text):
+    matches = list(_GDOC_LINK_RE.finditer(text))
+    if not matches:
+        return
+    program = store.chat_program(chat_id)
+    if program:
+        team_chat = store.program_chat_id(program)
+        if not team_chat or not _user_is_member_of_chat(uid, team_chat):
+            return
+    for m in matches:
         store.link_chat_doc(chat_id, m.group(1))
 
 
@@ -435,12 +455,13 @@ def _ingest(event) -> None:
     if src is None:
         return
     chat_id = str(getattr(src, "chat_id", "") or "")
+    uid = str(getattr(src, "user_id", "") or "")
     text = getattr(event, "text", "") or ""
     store.add({
         "chat_id": chat_id,
         "message_id": str(getattr(event, "message_id", "") or ""),
         "ts": time.time(),
-        "user_id": str(getattr(src, "user_id", "") or ""),
+        "user_id": uid,
         "user_name": getattr(src, "user_name", "") or "",
         "chat_type": getattr(src, "chat_type", "") or "",
         "chat_name": getattr(src, "chat_name", "") or "",
@@ -449,7 +470,7 @@ def _ingest(event) -> None:
         "reply_to_message_id": str(getattr(event, "reply_to_message_id", "") or ""),
         "reply_to_author": getattr(event, "reply_to_author_name", "") or "",
     })
-    _link_chat_docs(chat_id, text)
+    _link_chat_docs(chat_id, text, uid)
 
 
 def _auto_approve_pairing(uid: str, user_name: str = "") -> None:
