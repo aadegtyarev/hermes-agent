@@ -12,6 +12,7 @@ upfront check for how much there is before paging a large window.
 """
 from __future__ import annotations
 
+import contextlib
 import re
 import sqlite3
 import threading
@@ -26,11 +27,35 @@ def _db_path() -> str:
     return str(get_hermes_home() / "telegram.db")
 
 
-def _conn() -> sqlite3.Connection:
+@contextlib.contextmanager
+def _conn():
+    """A ``with _conn() as c:`` connection that actually closes on exit.
+
+    ``sqlite3.Connection`` is its own context manager, but its ``__exit__``
+    only commits/rolls back the transaction — it does NOT close the
+    connection (verified; this is documented Python behavior, easy to miss).
+    Every ``with _conn() as c:`` call site in this file (there are ~15 —
+    every public function below) was therefore leaking one file descriptor
+    per call, completely independent of the client-chat feature. In a
+    long-lived gateway process ingesting messages continuously, that adds up
+    to real fd exhaustion over days/weeks — and the isolation guards in
+    __init__.py fail OPEN when a store call raises, so hitting the fd limit
+    doesn't just break ingestion, it silently disables every isolation check
+    too. This wrapper preserves the exact ``with _conn() as c:`` call-site
+    syntax everywhere else in this file (zero other changes needed) while
+    actually closing the connection, success or failure.
+    """
     c = sqlite3.connect(_db_path(), timeout=10)
     c.row_factory = sqlite3.Row
     c.execute("PRAGMA journal_mode=WAL")
-    return c
+    try:
+        yield c
+        c.commit()
+    except Exception:
+        c.rollback()
+        raise
+    finally:
+        c.close()
 
 
 def _add_column_if_missing(c: sqlite3.Connection, table: str, column: str, decl: str) -> None:
@@ -305,7 +330,7 @@ def chat_doc_ids(chat_id: str) -> set[str]:
 # ── Resolving which chat a tool call's session belongs to ───────────────────
 
 
-def origin_chat_id(session_id: str) -> str | None:
+def origin_chat_id(session_id: str, _depth: int = 0) -> str | None:
     """Resolve the Telegram chat_id the CURRENT tool call's session belongs to.
 
     ``pre_tool_call`` hooks and tool handlers alike get ``session_id`` (the
@@ -320,16 +345,44 @@ def origin_chat_id(session_id: str) -> str | None:
     or on any lookup error — fail-open to "can't tell"; callers only restrict
     when this resolves AND the resolved chat is registered as ``client`` mode.
 
+    Follows ``parent_session_id`` when the row's own ``chat_id`` is empty —
+    mid-turn context compression (agent/conversation_compression.py) rotates
+    ``agent.session_id`` to a freshly-created row that records only
+    ``parent_session_id``; the gateway backfills that row's own ``chat_id``
+    only AFTER the turn returns (gateway/run.py). Without following the
+    chain, every tool call for the rest of a compressed turn would resolve to
+    "unknown chat" and silently lose the client-chat isolation guard for
+    exactly the long-running conversations this feature targets. Depth-capped
+    against a corrupted/cyclic parent chain.
+
+    Also checks the resolved row's own ``source`` is ``"telegram"`` — a
+    chat_id collision with a differently-sourced session (unlikely, but
+    cheap to rule out) must not be treated as a Telegram chat.
+
     Lives here (not in ``__init__.py``, where it originated) so both the
     ``_pre_tool_call`` isolation guard AND ``tools.py``'s escalation handler
     can use it without a circular import between the two.
     """
-    if not session_id:
+    if not session_id or _depth > 5:
         return None
     try:
         from hermes_state import SessionDB
-        row = SessionDB(read_only=True).get_session(session_id)
-        return str(row.get("chat_id") or "").strip() or None if row else None
+        db = SessionDB(read_only=True)
+        try:
+            row = db.get_session(session_id)
+        finally:
+            db.close()
+        if not row:
+            return None
+        chat_id = str(row.get("chat_id") or "").strip()
+        if chat_id:
+            if str(row.get("source") or "").strip().lower() != "telegram":
+                return None
+            return chat_id
+        parent_id = str(row.get("parent_session_id") or "").strip()
+        if parent_id and parent_id != session_id:
+            return origin_chat_id(parent_id, _depth + 1)
+        return None
     except Exception:
         return None
 
