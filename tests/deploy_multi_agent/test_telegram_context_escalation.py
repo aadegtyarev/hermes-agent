@@ -51,8 +51,12 @@ def plugin(monkeypatch, tmp_path):
     mod.store.init()
 
     sent = []
-    monkeypatch.setattr(mod, "_send", lambda chat_id, text, parse_mode=None:
-                         sent.append({"chat_id": chat_id, "text": text, "parse_mode": parse_mode}))
+
+    def _fake_send(chat_id, text, parse_mode=None):
+        sent.append({"chat_id": chat_id, "text": text, "parse_mode": parse_mode})
+        return True  # _send now reports confirmed delivery, not just "didn't raise"
+
+    monkeypatch.setattr(mod, "_send", _fake_send)
     mod._TEST_SENT = sent
 
     yield mod
@@ -175,6 +179,54 @@ def test_escalation_falls_back_to_no_link_for_a_non_supergroup_chat_id(plugin, r
     text = plugin._TEST_SENT[0]["text"]
     assert "t.me" not in text
     assert "Acme Corp" in text
+
+
+def test_delivery_failure_is_reported_and_does_not_burn_the_cooldown(plugin, resolved_session, monkeypatch):
+    """_send returning False (confirmed delivery failure — a MarkdownV2
+    parse error, 429, bad token, bot removed from the team chat, ...) must
+    not be reported as a success, and must NOT consume the cooldown — the
+    whole point of checking the return value instead of assuming success
+    from "the HTTP call didn't raise"."""
+    _setup_client_chat(plugin)
+    monkeypatch.setattr(plugin, "_send", lambda *a, **k: False)
+
+    result = json.loads(plugin.T.handle_escalate_to_team(
+        {"message": "see this"}, session_id=resolved_session,
+    ))
+
+    assert result["escalated"] is False
+    assert result["reason"] == "delivery_failed"
+    assert plugin.store.last_escalation_ts("-700") is None  # cooldown not burned
+
+
+def test_delivery_failure_allows_an_immediate_retry(plugin, resolved_session, monkeypatch):
+    _setup_client_chat(plugin)
+    monkeypatch.setattr(plugin, "_send", lambda *a, **k: False)
+    plugin.T.handle_escalate_to_team({"message": "first attempt"}, session_id=resolved_session)
+
+    sent = []
+    monkeypatch.setattr(plugin, "_send", lambda chat_id, text, parse_mode=None: (sent.append(text), True)[1])
+    result = json.loads(plugin.T.handle_escalate_to_team(
+        {"message": "retry"}, session_id=resolved_session,
+    ))
+
+    assert result["escalated"] is True
+    assert len(sent) == 1
+
+
+def test_non_numeric_message_id_is_dropped_rather_than_breaking_the_link(plugin, resolved_session):
+    """message_id is model-supplied and interpolated into a MarkdownV2 URL —
+    a non-digit value must be ignored (falling back to no specific-message
+    link) rather than producing a malformed URL that breaks delivery."""
+    _setup_client_chat(plugin)
+
+    result = json.loads(plugin.T.handle_escalate_to_team(
+        {"message": "see this", "message_id": "not-a-number\nwith a newline"},
+        session_id=resolved_session,
+    ))
+
+    assert result["escalated"] is True
+    assert "not-a-number" not in plugin._TEST_SENT[0]["text"]
 
 
 def test_special_characters_in_message_do_not_break_markdownv2(plugin, resolved_session):
