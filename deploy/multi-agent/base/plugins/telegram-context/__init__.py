@@ -777,7 +777,14 @@ def _on_dispatch(event=None, gateway=None, session_store=None, **kwargs):
             return {"action": "skip", "reason": "DM sender not in the auto-collected allowlist"}
 
         # group / channel / thread
-        if chat_id in work:
+        # A program's own team chat responds and grants DM access exactly like a
+        # work chat: it's where the program's trusted operators coordinate and
+        # where escalations land, and their live membership there IS the program
+        # trust signal. It lives only in partner_programs (create_program never
+        # writes chats_allowed), so match it dynamically here rather than
+        # duplicating it into the work-chat list — remove the program and the
+        # team-chat behavior falls away with it.
+        if chat_id in work or store.is_program_team_chat(chat_id):
             _ingest(event)
             if uid:
                 store.add_dm_user(uid, getattr(src, "user_name", "") or "", chat_id)
