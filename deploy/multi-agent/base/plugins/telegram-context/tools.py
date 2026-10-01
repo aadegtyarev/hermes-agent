@@ -84,14 +84,19 @@ TELEGRAM_DM_ALLOWLIST = {"name": "telegram_dm_allowlist", "description": "List u
 ESCALATE_TO_TEAM_SCHEMA = {"name": "escalate_to_team", "description": (
     "Bring in the human team responsible for this chat — posts to their own team "
     "chat, never a private DM. Think of it like a capable junior colleague calling "
-    "over a senior: normal and expected when you're genuinely not confident in your "
-    "own answer, or the other person explicitly asks to talk to someone more "
-    "experienced. That is a good, professional call, not a failure — don't hold off "
-    "just because you already tried to help. Only usable inside an isolated client "
-    "chat; write 'message' the way you'd actually describe the situation to a "
-    "teammate walking in cold, not a fill-in-the-blanks template. Rate-limited per "
-    "chat — a repeat call too soon is reported back instead of sent again, so keep "
-    "helping conversationally until it clears."),
+    "over a senior: normal and expected when, AFTER genuinely trying to help, you're "
+    "still not confident in your own answer and it needs the team's expertise or a "
+    "decision, or the other person explicitly asks to talk to a human / someone more "
+    "experienced. That is a good, professional call, not a failure. But it is NOT a "
+    "reflex for 'I can't see / don't know something': do NOT escalate for a fact you "
+    "could just look up (use web_search/web_extract first), or for a question about "
+    "another chat or anything outside this chat that you simply don't have visibility "
+    "into — for those, just say so plainly and offer what you can actually help with. "
+    "Only usable inside an isolated client chat; write 'message' the way you'd "
+    "actually describe the situation to a teammate walking in cold, not a "
+    "fill-in-the-blanks template. Rate-limited per chat — a repeat call too soon is "
+    "reported back instead of sent again, so keep helping conversationally until it "
+    "clears."),
     "parameters": {"type": "object", "properties": {
         "message": {"type": "string", "description": "What's going on and why you're bringing the team in, in your own words."},
         "message_id": {"type": "string", "description": "The specific message id this is about, if there is one clearly relevant — included as a link. Omit if nothing specific applies."},
