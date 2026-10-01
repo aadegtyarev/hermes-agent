@@ -30,7 +30,10 @@ rests on, not anything in the agent's own prompt.
      as telegram_db_backup.py not importing store.py). An operator's own
      reply does NOT permanently exempt a chat — it only lowers this tick's
      urgency; the interval naturally brings it back up for review later so
-     the model can judge whether that reply actually resolved things.
+     the model can judge whether that reply actually resolved things. If the
+     getChatMember check itself fails (network blip, rate limit), the chat
+     is SKIPPED this tick rather than assumed-unanswered — a transient API
+     error must not look like silence and trigger escalation.
 
 Works directly against telegram.db's raw schema via sqlite3 (not store.py)
 because this runs as its own subprocess — same reasoning as
@@ -38,6 +41,7 @@ telegram_db_backup.py already established for this plugin's other cron script.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sqlite3
@@ -62,15 +66,32 @@ _ACTIVITY_TIERS = (
 _MAX_MESSAGES_PER_CHAT = 30
 _MAX_CHATS_PER_TICK = 25
 
+# The digest's LAST line of stdout must always be something THIS SCRIPT
+# controls, never partner-authored text — see the module docstring and
+# main()'s use of this below.
+_DIGEST_FOOTER = "--- end of client-chat batch-review digest ---"
 
-def _conn() -> sqlite3.Connection:
+
+@contextlib.contextmanager
+def _conn():
+    """Same close-on-exit fix as store.py's _conn() — this script's own
+    process exits right after main() returns, so the leak this guards
+    against is far less severe here than in the long-lived gateway process,
+    but there's no reason to leave it unclosed regardless."""
     c = sqlite3.connect(str(get_hermes_home() / "telegram.db"), timeout=10)
     c.row_factory = sqlite3.Row
     c.execute(
         "CREATE TABLE IF NOT EXISTS chat_review_state("
         "chat_id TEXT PRIMARY KEY, last_reviewed_ts REAL)"
     )
-    return c
+    try:
+        yield c
+        c.commit()
+    except Exception:
+        c.rollback()
+        raise
+    finally:
+        c.close()
 
 
 def _tier_interval_seconds(recent_hourly_rate: float) -> int:
@@ -80,10 +101,18 @@ def _tier_interval_seconds(recent_hourly_rate: float) -> int:
     return _ACTIVITY_TIERS[-1][1]
 
 
-def _is_live_member(chat_id: str, user_id: str) -> bool:
+def _is_live_member(chat_id: str, user_id: str) -> bool | None:
+    """True/False on a confirmed answer, None when the check itself failed.
+
+    None is NOT the same as False: a caller must not treat "couldn't tell"
+    as "confirmed not a member" (which is what made a chat look
+    partner-unanswered in an earlier version — a network blip or rate limit
+    across the whole deployment would have made every client chat look
+    silent at once, triggering a mass, spurious review/escalation wave).
+    """
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     if not token or not chat_id or not user_id:
-        return False
+        return None
     try:
         url = (f"https://api.telegram.org/bot{token}/getChatMember"
                f"?chat_id={urllib.parse.quote(str(chat_id))}&user_id={user_id}")
@@ -91,12 +120,23 @@ def _is_live_member(chat_id: str, user_id: str) -> bool:
             data = json.loads(r.read().decode())
         return (data.get("result") or {}).get("status") in _MEMBER_STATUSES
     except Exception:
-        return False
+        return None
 
 
 def _due_chats(c: sqlite3.Connection, now: float) -> list[dict]:
+    # Oldest-reviewed-first (never-reviewed = epoch 0, sorts first) — without
+    # this, chats_allowed's own row order decided who got checked when
+    # _MAX_CHATS_PER_TICK caps the batch, and the SAME first-N chats won
+    # every tick while later-registered ones starved indefinitely (their own
+    # last_reviewed_ts never advances, but neither did their position in an
+    # unordered scan). Ordering by last-reviewed means a chat skipped this
+    # tick is now the FRONT of the queue next tick, not stuck at the back.
     client_chats = c.execute(
-        "SELECT chat_id, title, program FROM chats_allowed WHERE mode='client'"
+        "SELECT ca.chat_id AS chat_id, ca.title AS title, ca.program AS program "
+        "FROM chats_allowed ca "
+        "LEFT JOIN chat_review_state crs ON crs.chat_id = ca.chat_id "
+        "WHERE ca.mode='client' "
+        "ORDER BY COALESCE(crs.last_reviewed_ts, 0) ASC"
     ).fetchall()
 
     due = []
@@ -131,19 +171,29 @@ def _due_chats(c: sqlite3.Connection, now: float) -> list[dict]:
         ).fetchone()
         if not last_msg:
             continue  # nothing ever ingested here
-        if _is_live_member(team_chat["chat_id"], last_msg["user_id"]):
+
+        is_team_reply = _is_live_member(team_chat["chat_id"], last_msg["user_id"])
+        if is_team_reply is None:
+            continue  # couldn't confirm either way — skip, don't guess
+        if is_team_reply:
             # Last word was already the team's own — not silent from the
             # partner's side. Still worth an occasional pass (the interval
             # check above already rate-limits this), but not urgent right now.
             continue
 
+        # Newest _MAX_MESSAGES_PER_CHAT, not oldest: a chat with more unread
+        # traffic than the cap than deserves the RECENT context most (what's
+        # actionable right now), not a window frozen at whatever was first
+        # after the last review. Fetched DESC then reversed for chronological
+        # display order.
         new_messages = c.execute(
             "SELECT user_name, text, ts FROM messages WHERE chat_id=? AND ts>? "
-            "ORDER BY rowid ASC LIMIT ?",
+            "ORDER BY rowid DESC LIMIT ?",
             (chat_id, last_reviewed_ts, _MAX_MESSAGES_PER_CHAT),
         ).fetchall()
         if not new_messages:
             continue
+        new_messages = list(reversed(new_messages))
 
         due.append({
             "chat_id": chat_id,
@@ -176,6 +226,14 @@ def main() -> int:
         for m in chat["messages"]:
             lines.append(f"- {m['user_name'] or 'unknown'}: {m['text']}")
         lines.append("")
+    # cron/scheduler.py's _parse_wake_gate reads the LAST non-empty stdout
+    # line as a {"wakeAgent": false} gate (skip the LLM call this tick).
+    # Without this fixed, script-controlled footer, a partner message whose
+    # own text happens to end in that exact JSON shape would become the
+    # actual last line and silently suppress review for every chat in this
+    # digest — worse, main() has already marked them all reviewed by this
+    # point, so those messages would never be shown again.
+    lines.append(_DIGEST_FOOTER)
     print("\n".join(lines))
     return 0
 

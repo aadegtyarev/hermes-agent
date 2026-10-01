@@ -223,6 +223,8 @@ def test_deep_link_none_for_a_basic_group_id(plugin):
 def test_flag_chats_escalates_each_valid_entry(plugin):
     _setup_client_chat(plugin, client_chat="-700", team_chat="-500")
     _setup_client_chat(plugin, client_chat="-701", team_chat="-500")
+    plugin.store.mark_reviewed("-700")
+    plugin.store.mark_reviewed("-701")
 
     result = json.loads(plugin.T.handle_partner_flag_chats({"flags": [
         {"chat_id": "-700", "reason": "partner sent photos from the site"},
@@ -249,6 +251,7 @@ def test_flag_chats_rejects_a_chat_id_that_isnt_a_registered_client_chat(plugin)
 
 def test_flag_chats_respects_the_same_cooldown_as_escalate_to_team(plugin, resolved_session):
     _setup_client_chat(plugin)
+    plugin.store.mark_reviewed("-700")
     plugin.T.handle_escalate_to_team({"message": "first"}, session_id=resolved_session)
 
     result = json.loads(plugin.T.handle_partner_flag_chats({"flags": [
@@ -273,3 +276,38 @@ def test_flag_chats_skips_entries_missing_chat_id_or_reason(plugin):
 def test_flag_chats_rejects_non_list_flags(plugin):
     result = json.loads(plugin.T.handle_partner_flag_chats({"flags": "not-a-list"}))
     assert "error" in result
+
+
+def test_flag_chats_rejects_a_valid_chat_not_in_the_current_batch(plugin):
+    """The core of the H6 fix: a REAL, registered client chat that simply
+    wasn't part of this tick's digest (never reviewed, or reviewed too long
+    ago) must be refused — otherwise injected partner text in one chat's
+    digest could steer the model into flagging an unrelated chat (possibly
+    under a different program entirely), delivering attacker-chosen text
+    into that other team's chat."""
+    _setup_client_chat(plugin, client_chat="-700", team_chat="-500")
+    # Deliberately NOT calling store.mark_reviewed("-700") — this chat is
+    # registered and otherwise valid, but was never actually shown to the
+    # batch-reviewer model.
+
+    result = json.loads(plugin.T.handle_partner_flag_chats({"flags": [
+        {"chat_id": "-700", "reason": "steered via injected text"},
+    ]}))
+
+    assert result["results"][0]["ok"] is False
+    assert "current review batch" in result["results"][0]["error"]
+    assert plugin._TEST_SENT == []
+
+
+def test_flag_chats_rejects_a_stale_review_timestamp(plugin):
+    """A chat reviewed long ago (well outside the recency window) must be
+    treated the same as never-reviewed — the window exists so a stale
+    leftover timestamp from a much earlier tick can't be replayed."""
+    _setup_client_chat(plugin, client_chat="-700", team_chat="-500")
+    plugin.store.mark_reviewed("-700", ts=time.time() - plugin.T._RECENTLY_REVIEWED_WINDOW_SECONDS - 60)
+
+    result = json.loads(plugin.T.handle_partner_flag_chats({"flags": [
+        {"chat_id": "-700", "reason": "too late"},
+    ]}))
+
+    assert result["results"][0]["ok"] is False
