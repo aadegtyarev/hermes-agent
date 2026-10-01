@@ -214,6 +214,23 @@ def remove_chat(chat_id: str) -> bool:
         return c.execute("DELETE FROM chats_allowed WHERE chat_id=?", (str(chat_id),)).rowcount > 0
 
 
+def forget_chat_state(chat_id: str) -> None:
+    """Drop every per-chat table this plugin accumulates for ``chat_id`` —
+    doc-link allowlist, escalation cooldown, batch-review clock. Without
+    this, /hermes_forget only removed the chats_allowed row; re-registering
+    the SAME chat_id later (a new client chat, possibly under a different
+    program) would inherit the PREVIOUS occupant's gdoc allowlist and
+    escalation/review timestamps — a stale doc-id allowlist is the concerning
+    one (a new partner's chat trusting documents an unrelated prior chat
+    once linked)."""
+    if not chat_id:
+        return
+    with _LOCK, _conn() as c:
+        c.execute("DELETE FROM chat_doc_links WHERE chat_id=?", (str(chat_id),))
+        c.execute("DELETE FROM chat_escalations WHERE chat_id=?", (str(chat_id),))
+        c.execute("DELETE FROM chat_review_state WHERE chat_id=?", (str(chat_id),))
+
+
 def chats_by_mode(mode: str) -> set[str]:
     with _conn() as c:
         return {r["chat_id"] for r in
@@ -249,15 +266,26 @@ def list_chats() -> list[dict]:
 # ── Programs: a team's own chat + every client chat registered under it ────
 
 
+_PROGRAM_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
+
 def create_program(program: str, chat_id: str, created_by: str) -> bool:
     """Bind ``program`` to ``chat_id`` as that program's team chat.
 
-    Returns False (no-op) if the program name is already taken, or if
-    ``chat_id`` is already registered as something else (a client chat, or
-    another program's team chat) — a chat is exactly one thing.
+    Returns False (no-op) if ``program`` isn't lowercase-alnum/-/_ (matches
+    the style already used for every program name in this feature —
+    "journalist-partners", "support-clients" — and avoids a name containing
+    spaces/punctuation silently becoming part of other tables' primary keys
+    unchecked), if the program name is already taken, or if ``chat_id`` is
+    already registered as something else (a client chat, or another
+    program's team chat) — a chat is exactly one thing. Callers should
+    normalize case before calling (see __init__.py's _handle_hermes_program)
+    since this is case-SENSITIVE storage — normalizing here too would let a
+    caller's own "does it already exist" lookup (done before calling this)
+    disagree with what actually gets stored.
     """
     import time
-    if not program or not chat_id:
+    if not program or not chat_id or not _PROGRAM_NAME_RE.match(program):
         return False
     with _LOCK, _conn() as c:
         if c.execute("SELECT 1 FROM partner_programs WHERE program=?", (program,)).fetchone():

@@ -344,7 +344,13 @@ def _handle_hermes_program(chat_id: str, uid: str, title: str, raw_text: str):
         return _HANDLED
 
     parts = raw_text.split(maxsplit=1)
-    arg = parts[1].strip() if len(parts) > 1 else ""
+    # Normalized once, here, so both the "does it already exist" lookup and
+    # the eventual create() call agree — without this, "/hermes_program Foo"
+    # and an existing "foo" would be treated as two different programs
+    # (case-sensitive dict key match), and a name containing spaces would
+    # silently become part of chat_doc_links/chat_escalations' primary keys
+    # unchecked.
+    arg = parts[1].strip().lower() if len(parts) > 1 else ""
     progs = store.programs()
 
     def _register_client(program_name: str) -> None:
@@ -379,7 +385,7 @@ def _handle_hermes_program(chat_id: str, uid: str, title: str, raw_text: str):
     return _HANDLED
 
 
-def _handle_command(event, src, chat_id: str, uid: str):
+def _handle_command(event, src, chat_id: str, uid: str, ctype: str = ""):
     """If the message is a /hermes_* chat-admin command, act on it and return a skip
     action (so it isn't forwarded to the agent). Returns None if not a command."""
     text = (getattr(event, "text", "") or "").strip()
@@ -391,6 +397,15 @@ def _handle_command(event, src, chat_id: str, uid: str):
     title = getattr(src, "chat_name", "") or ""
 
     if cmd == "/hermes_program":
+        if ctype == "dm":
+            # Registering a 1:1 DM as either a program's team chat or a
+            # client chat makes no sense (a program needs a TEAM — multiple
+            # members whose live membership is the trust signal; a client
+            # chat's whole point is a group with an outside party) and was
+            # never the intent — silently refuse rather than let a team
+            # member accidentally apply client-mode tool restrictions (or
+            # program-admin status) to their own private chat with the bot.
+            return _NON_ADMIN_SILENT
         return _handle_hermes_program(chat_id, uid, title, text)
 
     if uid not in _admin_users():
@@ -407,6 +422,7 @@ def _handle_command(event, src, chat_id: str, uid: str):
     elif cmd == "/hermes_forget":
         removed_program = store.remove_program_by_chat(chat_id)
         removed_chat = store.remove_chat(chat_id)
+        store.forget_chat_state(chat_id)
         if removed_program:
             _send(chat_id, f"🗑 Программа «{removed_program}» удалена (чат команды освобождён).")
         elif removed_chat:
@@ -710,7 +726,7 @@ def _on_dispatch(event=None, gateway=None, session_store=None, **kwargs):
 
         # Admin chat-management commands run before gating, so they work even in a
         # chat that isn't enrolled yet (otherwise the gate would skip them first).
-        cmd_result = _handle_command(event, src, chat_id, uid)
+        cmd_result = _handle_command(event, src, chat_id, uid, ctype)
         if cmd_result is not None:
             return cmd_result
 
