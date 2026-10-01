@@ -183,6 +183,83 @@ def test_missing_or_empty_target_is_a_safe_no_op(plugin):
     assert plugin._pre_tool_call(tool_name="send_message", args=None) is None
 
 
+# ── cronjob's own delivery path bypasses send_message's guard entirely       ─
+# (cron/scheduler.py's _deliver_result calls send_message_tool internals
+# directly when a job fires, never going through handle_function_call/
+# pre_tool_call) — the only enforcement point available without a core
+# change is here, at job creation/update time.
+
+def test_blocks_cronjob_create_delivering_into_a_readonly_chat(plugin, monkeypatch):
+    monkeypatch.setenv("TELEGRAM_READONLY_CHATS", "-100")
+
+    result = plugin._pre_tool_call(tool_name="cronjob", args={
+        "action": "create", "deliver": "telegram:-100", "prompt": "x", "schedule": "1h",
+    })
+
+    assert result is not None and result["action"] == "block"
+    assert "-100" in result["message"]
+
+
+def test_blocks_cronjob_update_retargeting_into_a_readonly_chat(plugin, monkeypatch):
+    monkeypatch.setenv("TELEGRAM_READONLY_CHATS", "-100")
+
+    result = plugin._pre_tool_call(tool_name="cronjob", args={
+        "action": "update", "job_id": "abc123", "deliver": "telegram:-100",
+    })
+
+    assert result is not None and result["action"] == "block"
+
+
+def test_blocks_cronjob_deliver_all_when_any_readonly_chat_exists(plugin, monkeypatch):
+    """deliver='all' fans out to every connected channel at fire time —
+    including a read-only Telegram chat — without naming it explicitly."""
+    monkeypatch.setenv("TELEGRAM_READONLY_CHATS", "-100")
+
+    result = plugin._pre_tool_call(tool_name="cronjob", args={
+        "action": "create", "deliver": "all", "prompt": "x", "schedule": "1h",
+    })
+
+    assert result is not None and result["action"] == "block"
+
+
+def test_blocks_cronjob_comma_separated_deliver_containing_a_readonly_target(plugin, monkeypatch):
+    monkeypatch.setenv("TELEGRAM_READONLY_CHATS", "-100")
+
+    result = plugin._pre_tool_call(tool_name="cronjob", args={
+        "action": "create", "deliver": "origin,telegram:-100", "prompt": "x", "schedule": "1h",
+    })
+
+    assert result is not None and result["action"] == "block"
+
+
+def test_allows_cronjob_delivering_into_a_non_readonly_chat(plugin, monkeypatch):
+    monkeypatch.setenv("TELEGRAM_READONLY_CHATS", "-100")
+
+    result = plugin._pre_tool_call(tool_name="cronjob", args={
+        "action": "create", "deliver": "telegram:-999", "prompt": "x", "schedule": "1h",
+    })
+
+    assert result is None
+
+
+def test_allows_cronjob_deliver_all_when_no_readonly_chats_exist(plugin):
+    result = plugin._pre_tool_call(tool_name="cronjob", args={
+        "action": "create", "deliver": "all", "prompt": "x", "schedule": "1h",
+    })
+
+    assert result is None
+
+
+def test_ignores_cronjob_actions_other_than_create_or_update(plugin, monkeypatch):
+    monkeypatch.setenv("TELEGRAM_READONLY_CHATS", "-100")
+
+    for action in ("list", "pause", "resume", "remove", "run"):
+        result = plugin._pre_tool_call(tool_name="cronjob", args={
+            "action": action, "deliver": "telegram:-100",
+        })
+        assert result is None, f"action={action} should not be guarded (not a new delivery target)"
+
+
 # ── Regression: /hermes_forget must still work from inside the RO chat ─────
 # (the actual bug in the reverted core-mirroring approach — a chat marked
 # read-only silently stopped reaching this plugin's own dispatch hook at all)
