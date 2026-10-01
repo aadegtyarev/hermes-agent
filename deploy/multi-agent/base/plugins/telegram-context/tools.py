@@ -329,10 +329,20 @@ def handle_program_client_chats(args, **kw):
 
     query = str((args or {}).get("query") or "").strip()
     if not query:
-        return tool_result({
+        out = {
             "program": program, "count": len(chats),
             "client_chats": [_fmt_client_chat(c) for c in chats[:limit]],
-        })
+        }
+        if not chats:
+            # Be explicit so the model doesn't misread an empty list as "I have
+            # no access" — the team chat is NOT isolated; there simply are no
+            # client chats registered under this program yet.
+            out["note"] = (
+                f"No client chats are registered under program '{program}' yet. "
+                "This is not an access limitation — you have full access from this "
+                "team chat; there just aren't any to list."
+            )
+        return tool_result(out)
 
     # Match on title (substring, case-insensitive) OR message content (FTS).
     ql = query.lower()
@@ -352,10 +362,16 @@ def handle_program_client_chats(args, **kw):
         matched[cid].setdefault("snippet", (h.get("text") or "")[:300])
 
     results = sorted(matched.values(), key=lambda c: c.get("last_ts") or 0, reverse=True)
-    return tool_result({
+    out = {
         "program": program, "query": query, "count": len(results),
         "client_chats": [_fmt_client_chat(c) for c in results[:limit]],
-    })
+    }
+    if not results:
+        out["note"] = (
+            "No client chat matched — either none are registered under this "
+            f"program yet, or none mention {query!r}. Not an access limitation."
+        )
+    return tool_result(out)
 
 
 def _fmt_client_chat(c: dict) -> dict:

@@ -452,3 +452,17 @@ def test_program_client_chats_query_does_not_leak_other_programs_chats(plugin, m
 
     # -800 belongs to support-clients, not this team's program — must not appear.
     assert all(c["chat_id"] != "-800" for c in result["client_chats"])
+
+
+def test_program_client_chats_empty_list_explains_it_is_not_an_access_limit(plugin, monkeypatch):
+    """Regression for a live 'тупняк': with no client chats registered, the tool
+    must make clear the team chat still has full access — an empty list means
+    'none registered', not 'I can't see them'."""
+    plugin.store.create_program("journalist-partners", "-500", "111")  # team chat, no clients
+    sess = _team_session(plugin, monkeypatch)
+
+    result = json.loads(plugin.T.handle_program_client_chats({}, session_id=sess))
+
+    assert result["count"] == 0
+    assert "note" in result
+    assert "not an access limitation" in result["note"].lower()
