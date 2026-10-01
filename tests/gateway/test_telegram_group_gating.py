@@ -194,6 +194,30 @@ def test_unmentioned_group_messages_can_be_observed_without_dispatching():
     asyncio.run(_run())
 
 
+def test_clean_bot_trigger_text_keeps_directed_command_separate_from_arg():
+    # A directed slash command "/cmd@botname arg" must not collapse into
+    # "/cmdarg": Telegram attaches "@botname" straight to the command token,
+    # and eating the following space glues the command to its argument so it
+    # no longer parses as a command (regression: /hermes_program <name> in a
+    # group went silent).
+    adapter = _make_adapter(bot_username="gpio_engineer_bot")
+    assert (
+        adapter._clean_bot_trigger_text("/hermes_program@gpio_engineer_bot article")
+        == "/hermes_program article"
+    )
+    # No-arg directed command still strips cleanly.
+    assert (
+        adapter._clean_bot_trigger_text("/hermes_program@gpio_engineer_bot")
+        == "/hermes_program"
+    )
+    # Free-text mentions keep their prior behavior (no leading/doubled space).
+    assert adapter._clean_bot_trigger_text("@gpio_engineer_bot привет") == "привет"
+    assert (
+        adapter._clean_bot_trigger_text("hey @gpio_engineer_bot how are you")
+        == "hey how are you"
+    )
+
+
 def test_observed_group_context_uses_shared_source_and_prompt_for_later_mentions():
     async def _run():
         adapter = _make_adapter(
