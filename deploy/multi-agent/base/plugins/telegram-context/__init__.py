@@ -448,39 +448,32 @@ _GDOC_LINK_RE = re.compile(r"(?:https?://)?docs\.google\.com/document/d/([a-zA-Z
 
 
 def _link_chat_docs(chat_id: str, text: str, uid: str = "") -> None:
-    """Record Google Docs links POSTED BY A CONFIRMED TEAM MEMBER of a client
-    chat's own program — the ONLY source of truth for "which documents may
-    gdoc_read touch from this chat" (see the isolation guard in
-    _pre_tool_call). Populated incrementally as links are actually shared,
-    never pre-registered at chat-registration time (a client chat may share
-    several documents over its lifetime; which ones matter isn't known up
+    """Record Google Docs links that appear in a chat — the source of truth for
+    "which documents may gdoc_read touch from this chat" (see the isolation
+    guard in _pre_tool_call). Populated incrementally as links are actually
+    shared, never pre-registered at chat-registration time (a client chat may
+    share several documents over its lifetime; which ones matter isn't known up
     front).
 
-    The team-membership check matters: an EARLIER version linked whatever
-    doc_id appeared in ANY message regardless of sender, which let the
-    untrusted partner themselves grant gdoc_read access to an arbitrary
-    internal document just by pasting its link into their own chat — the
-    bot would then open it with the TEAM's Drive credentials. Only a
-    confirmed live member of the chat's own program's team chat can add a
-    document to the allowlist; a partner-posted link to even a genuinely
-    legitimate shared document is simply not auto-trusted (the team member
-    re-sharing it, or using escalate_to_team, re-establishes trust).
+    Trust model: the authorization boundary is the Google service account's OWN
+    access rights, enforced by Google at read time — the account's scopes are
+    read-only (`documents.readonly` + `drive.readonly`) and it is NOT a
+    domain-wide-delegated identity, so it can only open a document that was
+    explicitly shared with its address or shared "anyone with the link". A
+    partner pasting a link to an arbitrary INTERNAL document the account was
+    never given simply gets a 403/404 from Google — nothing leaks. That lets
+    the primary workflow work (a partner shares THEIR OWN draft and the bot
+    reads it) without trusting the partner to grant access to things the
+    account can't already see. The remaining guards stay: gdoc_read is pinned
+    to doc_ids that actually appeared in THIS chat (so the model can't open a
+    doc_id it merely guessed), and gdrive_search / arbitrary Drive browsing is
+    blocked outright for client chats (see _CLIENT_CHAT_ALLOWED_TOOLS).
 
-    For a non-client chat (work/readonly), chat_program() is None and links
-    are recorded unconditionally as before — harmless (the isolation guard
-    only ever reads chat_doc_links for client-mode chats).
+    `uid` is accepted for call-site compatibility but no longer gates trust.
     """
     if not chat_id or not text:
         return
-    matches = list(_GDOC_LINK_RE.finditer(text))
-    if not matches:
-        return
-    program = store.chat_program(chat_id)
-    if program:
-        team_chat = store.program_chat_id(program)
-        if not team_chat or not _user_is_member_of_chat(uid, team_chat):
-            return
-    for m in matches:
+    for m in _GDOC_LINK_RE.finditer(text):
         store.link_chat_doc(chat_id, m.group(1))
 
 
@@ -599,6 +592,13 @@ _CLIENT_CHAT_ALLOWED_TOOLS = {
     "web_search",
     "web_extract",
     "vision_analyze",
+    # Read-only skills: the bot may consult its own domain-knowledge skills
+    # (e.g. wiren-board) to answer a partner well. Read side only — skill_manage
+    # (write) stays blocked, and skill_view confines file_path to the skill's
+    # own directory (path-traversal validated), so this is not a disk-read or
+    # Drive-search escape hatch.
+    "skill_view",
+    "skills_list",
 }
 # Of the above, these need EXTRA scoping even though they're allowed at all.
 _CLIENT_CHAT_SCOPED_READ_TOOLS = {"telegram_search", "telegram_recent"}

@@ -624,29 +624,22 @@ def test_link_chat_docs_matches_a_bare_domain_link_without_scheme(plugin):
     assert plugin.store.chat_doc_ids("-700") == {"BAREDOC123"}
 
 
-def test_link_chat_docs_untrusted_partner_cannot_grant_access_in_a_program_chat(plugin, monkeypatch):
-    """The core of the H4 fix: in a chat registered under a program, only a
-    link posted by a CONFIRMED team-chat member gets added to the gdoc
-    allowlist. Without this, a partner could paste a link to an arbitrary
-    internal document into their own chat and have the bot open it with the
-    team's Drive credentials."""
+def test_link_chat_docs_records_partner_posted_link_in_a_program_chat(plugin, monkeypatch):
+    """New trust model: a link the PARTNER posts in a client chat IS recorded.
+    The authorization boundary is the Google service account's own read-only,
+    non-delegated access (Google refuses anything not shared with it at read
+    time), not who pasted the link — so the primary workflow (partner shares
+    their own draft) works. The remaining guards live elsewhere: gdoc_read is
+    still pinned to doc_ids seen in THIS chat, and gdrive_search is blocked."""
     plugin.store.create_program("journalist-partners", "-500", "111")
     plugin.store.set_chat("-700", "client", "Acme", "111", program="journalist-partners")
-    monkeypatch.setattr(plugin, "_user_is_member_of_chat", lambda uid, chat_id: uid == "111")
-
-    # Partner (uid=999, NOT a team member) pastes a link — must NOT be trusted.
-    plugin._link_chat_docs("-700", "check this out: https://docs.google.com/document/d/SECRET/edit", uid="999")
-    assert plugin.store.chat_doc_ids("-700") == set()
-
-    # A confirmed team member (uid=111) posting the SAME link IS trusted.
-    plugin._link_chat_docs("-700", "https://docs.google.com/document/d/SECRET/edit", uid="111")
-    assert plugin.store.chat_doc_ids("-700") == {"SECRET"}
+    # Partner (uid=999, not a team member) pastes their own draft's link.
+    plugin._link_chat_docs("-700", "вот черновик: https://docs.google.com/document/d/DRAFT/edit", uid="999")
+    assert plugin.store.chat_doc_ids("-700") == {"DRAFT"}
 
 
 def test_link_chat_docs_unconditional_for_chats_without_a_program(plugin):
-    """A work/readonly chat (chat_program() is None) keeps the old,
-    unconditional behavior — the trust check only matters for client-mode
-    chats, where chat_doc_links is actually read back as an allowlist."""
+    """A work/readonly chat records in-chat doc links the same way."""
     plugin.store.set_chat("-800", "work", "", "111")
     plugin._link_chat_docs("-800", "https://docs.google.com/document/d/ANY/edit", uid="999999")
     assert plugin.store.chat_doc_ids("-800") == {"ANY"}
@@ -673,6 +666,80 @@ def test_gdoc_read_allowed_for_a_doc_the_chat_actually_shared(plugin, fake_sessi
     )
 
     assert result is None
+
+
+def test_gdoc_read_scoping_is_by_doc_id_tolerating_url_decoration(plugin, fake_session_db):
+    """Scoping keys on the extracted doc ID, not the raw URL string: a heading
+    anchor / tab param / trailing path on a SHARED doc still matches (same id),
+    while a DIFFERENT id stays blocked no matter how the URL is decorated."""
+    _client_session(plugin, fake_session_db, "sess-1", "-700")
+    plugin.store.link_chat_doc("-700", "SEEN123")
+
+    for decorated in (
+        "https://docs.google.com/document/d/SEEN123/edit#heading=h.abc123",
+        "https://docs.google.com/document/d/SEEN123/edit?tab=t.0",
+        "https://docs.google.com/document/d/SEEN123/edit?tab=t.0#heading=h.xyz",
+    ):
+        assert plugin._pre_tool_call(
+            tool_name="gdoc_read", args={"url": decorated}, session_id="sess-1",
+        ) is None, decorated
+
+    # A different doc id, even dressed up with a heading anchor, is still blocked.
+    assert plugin._pre_tool_call(
+        tool_name="gdoc_read",
+        args={"url": "https://docs.google.com/document/d/OTHER/edit#heading=h.abc"},
+        session_id="sess-1",
+    )["action"] == "block"
+
+
+def test_gdoc_scoping_parser_matches_the_google_docs_tool_parser(plugin):
+    """No parser differential: the isolation guard's id extraction must agree
+    with the google-docs tool's own, byte for byte, on tricky inputs — else a
+    crafted URL could pass the guard as id-A while the tool opens id-B. The two
+    regexes are deliberately duplicated (no hard cross-plugin import), so this
+    pins them equal against drift."""
+    import importlib.util
+    import sys
+    import types
+    from pathlib import Path
+
+    gdoc_dir = (
+        Path(__file__).resolve().parents[2]
+        / "deploy" / "multi-agent" / "base" / "plugins" / "google-docs"
+    )
+    pkg_name = "google_docs_parser_check"
+    pkg = types.ModuleType(pkg_name)
+    pkg.__path__ = [str(gdoc_dir)]
+    sys.modules[pkg_name] = pkg
+    try:
+        gauth_spec = importlib.util.spec_from_file_location(
+            f"{pkg_name}._gauth", gdoc_dir / "_gauth.py"
+        )
+        gauth_mod = importlib.util.module_from_spec(gauth_spec)
+        sys.modules[f"{pkg_name}._gauth"] = gauth_mod
+        gauth_spec.loader.exec_module(gauth_mod)
+
+        tools_spec = importlib.util.spec_from_file_location(
+            f"{pkg_name}.tools", gdoc_dir / "tools.py"
+        )
+        gdoc = importlib.util.module_from_spec(tools_spec)
+        gdoc.__package__ = pkg_name
+        sys.modules[f"{pkg_name}.tools"] = gdoc
+        tools_spec.loader.exec_module(gdoc)
+
+        for ref in (
+            "https://docs.google.com/document/d/ABC_123-xyz/edit#heading=h.0",
+            "https://docs.google.com/document/d/ABC_123-xyz/edit?tab=t.0",
+            "docs.google.com/document/d/BARE99/edit",
+            "ABC_123-xyz",
+            "not a url at all with spaces",
+            "",
+        ):
+            assert plugin._parse_gdoc_id(ref) == gdoc._parse_doc_id(ref), ref
+    finally:
+        for key in list(sys.modules):
+            if key.startswith(pkg_name):
+                del sys.modules[key]
 
 
 def test_gdoc_comments_same_scoping_as_gdoc_read(plugin, fake_session_db):
@@ -735,6 +802,7 @@ def test_gdoc_tools_unaffected_from_work_chats(plugin, fake_session_db):
     ("ssh_connect", {"host": "example.com"}),
     ("memory", {"action": "search", "query": "x"}),
     ("send_message", {"target": "telegram:-700"}),
+    ("skill_manage", {"action": "write_file", "name": "x", "path": "y", "content": "z"}),
     ("some_future_tool_nobody_has_written_yet", {}),
 ])
 def test_default_deny_blocks_every_tool_not_on_the_allowlist(plugin, fake_session_db, tool_name, args):
