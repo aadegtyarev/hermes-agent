@@ -527,6 +527,42 @@ def test_ingest_populates_chat_doc_links_from_a_real_message(plugin):
     assert plugin.store.chat_doc_ids("-700") == {"DOC999"}
 
 
+def test_link_chat_docs_matches_a_bare_domain_link_without_scheme(plugin):
+    """Telegram auto-links bare docs.google.com/... text (no http:// prefix)
+    — missing this meant a legitimately-shared doc could go unrecognized,
+    producing a false-negative block later."""
+    plugin._link_chat_docs("-700", "see docs.google.com/document/d/BAREDOC123/edit")
+    assert plugin.store.chat_doc_ids("-700") == {"BAREDOC123"}
+
+
+def test_link_chat_docs_untrusted_partner_cannot_grant_access_in_a_program_chat(plugin, monkeypatch):
+    """The core of the H4 fix: in a chat registered under a program, only a
+    link posted by a CONFIRMED team-chat member gets added to the gdoc
+    allowlist. Without this, a partner could paste a link to an arbitrary
+    internal document into their own chat and have the bot open it with the
+    team's Drive credentials."""
+    plugin.store.create_program("journalist-partners", "-500", "111")
+    plugin.store.set_chat("-700", "client", "Acme", "111", program="journalist-partners")
+    monkeypatch.setattr(plugin, "_user_is_member_of_chat", lambda uid, chat_id: uid == "111")
+
+    # Partner (uid=999, NOT a team member) pastes a link — must NOT be trusted.
+    plugin._link_chat_docs("-700", "check this out: https://docs.google.com/document/d/SECRET/edit", uid="999")
+    assert plugin.store.chat_doc_ids("-700") == set()
+
+    # A confirmed team member (uid=111) posting the SAME link IS trusted.
+    plugin._link_chat_docs("-700", "https://docs.google.com/document/d/SECRET/edit", uid="111")
+    assert plugin.store.chat_doc_ids("-700") == {"SECRET"}
+
+
+def test_link_chat_docs_unconditional_for_chats_without_a_program(plugin):
+    """A work/readonly chat (chat_program() is None) keeps the old,
+    unconditional behavior — the trust check only matters for client-mode
+    chats, where chat_doc_links is actually read back as an allowlist."""
+    plugin.store.set_chat("-800", "work", "", "111")
+    plugin._link_chat_docs("-800", "https://docs.google.com/document/d/ANY/edit", uid="999999")
+    assert plugin.store.chat_doc_ids("-800") == {"ANY"}
+
+
 def test_gdoc_read_blocked_for_a_doc_never_shared_in_this_client_chat(plugin, fake_session_db):
     _client_session(plugin, fake_session_db, "sess-1", "-700")
 
