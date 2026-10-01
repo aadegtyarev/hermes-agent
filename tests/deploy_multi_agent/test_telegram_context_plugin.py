@@ -803,6 +803,7 @@ def test_gdoc_tools_unaffected_from_work_chats(plugin, fake_session_db):
     ("memory", {"action": "search", "query": "x"}),
     ("send_message", {"target": "telegram:-700"}),
     ("skill_manage", {"action": "write_file", "name": "x", "path": "y", "content": "z"}),
+    ("program_client_chats", {}),  # team-chat enumeration must not work from a client chat
     ("some_future_tool_nobody_has_written_yet", {}),
 ])
 def test_default_deny_blocks_every_tool_not_on_the_allowlist(plugin, fake_session_db, tool_name, args):

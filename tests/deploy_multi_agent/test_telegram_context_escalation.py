@@ -363,3 +363,92 @@ def test_flag_chats_rejects_a_stale_review_timestamp(plugin):
     ]}))
 
     assert result["results"][0]["ok"] is False
+
+
+# ── program_client_chats: top-down enumeration + search, team-chat only ─────
+
+def _add_msg(plugin, chat_id, mid, text, ts):
+    plugin.store.add({
+        "chat_id": chat_id, "message_id": str(mid), "ts": ts,
+        "user_id": "p", "user_name": "Partner", "chat_type": "group",
+        "chat_name": "", "thread_id": "", "text": text,
+        "reply_to_message_id": "", "reply_to_author": "",
+    })
+
+
+def _team_session(plugin, monkeypatch, team_chat="-500"):
+    monkeypatch.setattr(plugin.store, "origin_chat_id",
+                        lambda session_id: team_chat if session_id == "team-sess" else None)
+    return "team-sess"
+
+
+def test_program_client_chats_lists_all_clients_from_the_team_chat(plugin, monkeypatch):
+    plugin.store.create_program("journalist-partners", "-500", "111")
+    plugin.store.set_chat("-700", "client", "Acme Corp", "222", program="journalist-partners")
+    plugin.store.set_chat("-701", "client", "Beta LLC", "222", program="journalist-partners")
+    _add_msg(plugin, "-700", 1, "older", 100.0)
+    _add_msg(plugin, "-701", 1, "newer", 200.0)
+    sess = _team_session(plugin, monkeypatch)
+
+    result = json.loads(plugin.T.handle_program_client_chats({}, session_id=sess))
+
+    assert result["program"] == "journalist-partners"
+    assert result["count"] == 2
+    # newest-active first
+    assert [c["chat_id"] for c in result["client_chats"]] == ["-701", "-700"]
+    assert {c["title"] for c in result["client_chats"]} == {"Acme Corp", "Beta LLC"}
+
+
+def test_program_client_chats_blocked_outside_a_team_chat(plugin, monkeypatch):
+    plugin.store.create_program("journalist-partners", "-500", "111")
+    plugin.store.set_chat("-700", "client", "Acme Corp", "222", program="journalist-partners")
+    # A client chat's session, not the team chat.
+    monkeypatch.setattr(plugin.store, "origin_chat_id",
+                        lambda session_id: "-700" if session_id == "sess" else None)
+
+    result = json.loads(plugin.T.handle_program_client_chats({}, session_id="sess"))
+
+    assert "error" in result
+
+
+def test_program_client_chats_query_matches_title(plugin, monkeypatch):
+    plugin.store.create_program("journalist-partners", "-500", "111")
+    plugin.store.set_chat("-700", "client", "Acme Corp", "222", program="journalist-partners")
+    plugin.store.set_chat("-701", "client", "Beta LLC", "222", program="journalist-partners")
+    sess = _team_session(plugin, monkeypatch)
+
+    result = json.loads(plugin.T.handle_program_client_chats({"query": "acme"}, session_id=sess))
+
+    assert result["count"] == 1
+    assert result["client_chats"][0]["chat_id"] == "-700"
+    assert result["client_chats"][0]["matched_on"] == "title"
+
+
+def test_program_client_chats_query_matches_message_content(plugin, monkeypatch):
+    plugin.store.create_program("journalist-partners", "-500", "111")
+    plugin.store.set_chat("-700", "client", "Acme Corp", "222", program="journalist-partners")
+    plugin.store.set_chat("-701", "client", "Beta LLC", "222", program="journalist-partners")
+    _add_msg(plugin, "-701", 1, "вопрос про CAN шину и терминаторы", 200.0)
+    sess = _team_session(plugin, monkeypatch)
+
+    result = json.loads(plugin.T.handle_program_client_chats({"query": "CAN"}, session_id=sess))
+
+    assert result["count"] == 1
+    hit = result["client_chats"][0]
+    assert hit["chat_id"] == "-701"
+    assert hit["matched_on"] == "content"
+    assert "CAN" in hit["snippet"]
+
+
+def test_program_client_chats_query_does_not_leak_other_programs_chats(plugin, monkeypatch):
+    plugin.store.create_program("journalist-partners", "-500", "111")
+    plugin.store.create_program("support-clients", "-600", "111")
+    plugin.store.set_chat("-700", "client", "Acme Corp", "222", program="journalist-partners")
+    plugin.store.set_chat("-800", "client", "Other Co", "333", program="support-clients")
+    _add_msg(plugin, "-800", 1, "CAN bus question in another program", 200.0)
+    sess = _team_session(plugin, monkeypatch)  # team chat -500 = journalist-partners
+
+    result = json.loads(plugin.T.handle_program_client_chats({"query": "CAN"}, session_id=sess))
+
+    # -800 belongs to support-clients, not this team's program — must not appear.
+    assert all(c["chat_id"] != "-800" for c in result["client_chats"])

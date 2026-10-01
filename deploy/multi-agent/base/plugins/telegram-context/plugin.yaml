@@ -10,6 +10,7 @@ provides_tools:
   - telegram_search
   - telegram_dm_allowlist
   - escalate_to_team
+  - program_client_chats
   - partner_flag_chats
 provides_hooks:
   - pre_gateway_dispatch

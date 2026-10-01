@@ -297,12 +297,89 @@ def handle_partner_flag_chats(args, **kw):
     return tool_result({"count": len(results), "results": results})
 
 
+PROGRAM_CLIENT_CHATS_SCHEMA = {"name": "program_client_chats", "description": (
+    "List the client chats of THIS program — only works from a program's own team "
+    "chat (the chat where the team coordinates). Use it to work top-down: build a "
+    "digest across all the program's client chats, or find a specific one by name "
+    "or topic. Without 'query' it returns every client chat (chat_id, title, last "
+    "activity, last-reviewed time, message count), newest-active first — then read "
+    "each with telegram_recent(chat_id=…). With 'query' it returns only the client "
+    "chats that match: by title, and by message content (full-text, so you can find "
+    "'the chat where CAN bus came up'). Returns nothing outside a team chat; a "
+    "client chat cannot use this to see sibling chats."),
+    "parameters": {"type": "object", "properties": {
+        "query": {"type": "string", "description": "Optional. Filter to client chats matching this in their title or message text. Omit to list all."},
+        "since_hours_ago": {"type": "number", "description": "Optional. With 'query', only match messages from at most this many hours ago."},
+        "limit": {"type": "integer", "description": "Max client chats to return (default 50)."},
+    }, "required": []}}
+
+
+def handle_program_client_chats(args, **kw):
+    session_id = str(kw.get("session_id") or "")
+    origin = store.origin_chat_id(session_id)
+    program = store.program_by_team_chat(origin) if origin else None
+    if not program:
+        return tool_error(
+            "program_client_chats only works from a program's own team chat. "
+            "This session isn't in one."
+        )
+    limit = int((args or {}).get("limit") or 50)
+    chats = store.program_client_chats(program)
+    by_id = {c["chat_id"]: c for c in chats}
+
+    query = str((args or {}).get("query") or "").strip()
+    if not query:
+        return tool_result({
+            "program": program, "count": len(chats),
+            "client_chats": [_fmt_client_chat(c) for c in chats[:limit]],
+        })
+
+    # Match on title (substring, case-insensitive) OR message content (FTS).
+    ql = query.lower()
+    matched: dict[str, dict] = {
+        cid: dict(c, matched_on="title")
+        for cid, c in by_id.items() if ql in (c.get("title") or "").lower()
+    }
+    since_ts, _ = _since_until(args)
+    hits = store.search_in_chats(query, list(by_id.keys()), 500, since_ts)
+    for h in hits:
+        cid = h["chat_id"]
+        base = by_id.get(cid)
+        if base is None:
+            continue
+        if cid not in matched:
+            matched[cid] = dict(base, matched_on="content")
+        matched[cid].setdefault("snippet", (h.get("text") or "")[:300])
+
+    results = sorted(matched.values(), key=lambda c: c.get("last_ts") or 0, reverse=True)
+    return tool_result({
+        "program": program, "query": query, "count": len(results),
+        "client_chats": [_fmt_client_chat(c) for c in results[:limit]],
+    })
+
+
+def _fmt_client_chat(c: dict) -> dict:
+    out = {
+        "chat_id": c.get("chat_id"),
+        "title": c.get("title"),
+        "last_activity_ts": c.get("last_ts"),
+        "last_reviewed_ts": c.get("last_reviewed_ts"),
+        "message_count": c.get("msg_count"),
+    }
+    if c.get("matched_on"):
+        out["matched_on"] = c["matched_on"]
+    if c.get("snippet"):
+        out["snippet"] = c["snippet"]
+    return out
+
+
 TOOLS = (
     ("telegram_thread", TELEGRAM_THREAD, handle_telegram_thread, "🧵"),
     ("telegram_recent", TELEGRAM_RECENT, handle_telegram_recent, "🕘"),
     ("telegram_search", TELEGRAM_SEARCH, handle_telegram_search, "🔎"),
     ("telegram_dm_allowlist", TELEGRAM_DM_ALLOWLIST, handle_telegram_dm_allowlist, "👥"),
     ("escalate_to_team", ESCALATE_TO_TEAM_SCHEMA, handle_escalate_to_team, "🆘"),
+    ("program_client_chats", PROGRAM_CLIENT_CHATS_SCHEMA, handle_program_client_chats, "🗂️"),
 )
 
 # Registered into its own toolset (telegram_batch_review), NOT `telegram` —
