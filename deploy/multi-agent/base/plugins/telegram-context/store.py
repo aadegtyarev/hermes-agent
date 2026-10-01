@@ -418,6 +418,41 @@ def record_escalation(chat_id: str, ts: float | None = None) -> None:
         )
 
 
+def mark_reviewed(chat_id: str, ts: float | None = None) -> None:
+    """Record that ``chat_id`` was just included in a batch-review digest.
+
+    Normally written by client_chat_batch_review.py's own raw-sqlite insert
+    (it's a standalone subprocess, doesn't import this module) — exposed
+    here too so tests (and any future in-process caller) don't need to
+    reach into telegram.db's schema directly to simulate "this chat was
+    reviewed this tick", which handle_partner_flag_chats' recency check
+    depends on.
+    """
+    if not chat_id:
+        return
+    with _LOCK, _conn() as c:
+        c.execute(
+            "INSERT OR REPLACE INTO chat_review_state(chat_id, last_reviewed_ts) VALUES(?,?)",
+            (str(chat_id), ts if ts is not None else time.time()),
+        )
+
+
+def last_reviewed_ts(chat_id: str) -> float | None:
+    """When client_chat_batch_review.py last included ``chat_id`` in a
+    digest — used by ``handle_partner_flag_chats`` to confirm a flagged
+    chat_id was ACTUALLY part of the current/most recent review batch, not
+    an arbitrary registered client chat the model (or injected partner text
+    it was shown) picked. See the ``_RECENTLY_REVIEWED_WINDOW`` check at
+    that call site."""
+    if not chat_id:
+        return None
+    with _conn() as c:
+        r = c.execute(
+            "SELECT last_reviewed_ts FROM chat_review_state WHERE chat_id=?", (str(chat_id),)
+        ).fetchone()
+        return r["last_reviewed_ts"] if r else None
+
+
 def add_dm_user(user_id: str, user_name: str = "", source_chat: str = "") -> None:
     import time
     if not user_id:

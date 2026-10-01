@@ -238,6 +238,9 @@ PARTNER_FLAG_CHATS_SCHEMA = {"name": "partner_flag_chats", "description": (
     }, "required": ["flags"]}}
 
 
+_RECENTLY_REVIEWED_WINDOW_SECONDS = 15 * 60  # generous vs. cron tick + agent-run time
+
+
 def handle_partner_flag_chats(args, **kw):
     flags = args.get("flags")
     if not isinstance(flags, list):
@@ -251,6 +254,23 @@ def handle_partner_flag_chats(args, **kw):
         reason = str(entry.get("reason") or "").strip()
         if not chat_id or not reason:
             results.append({"chat_id": chat_id, "ok": False, "error": "missing chat_id/reason"})
+            continue
+        # This tool's whole input (the chat digest) is partner-authored text,
+        # injected into the batch-reviewer's own prompt — the model could be
+        # steered into flagging a chat_id that was never actually part of
+        # THIS tick's digest (an unrelated client chat under a DIFFERENT
+        # program, say), which would deliver an attacker-chosen message into
+        # that other program's team chat. chat_review_state.last_reviewed_ts
+        # is set ONLY by client_chat_batch_review.py, for the chats it
+        # actually included this run — a chat_id without a recent timestamp
+        # there was not shown to the model this tick and is refused here,
+        # independent of whether it's otherwise a validly-registered chat.
+        reviewed = store.last_reviewed_ts(chat_id)
+        if reviewed is None or time.time() - reviewed > _RECENTLY_REVIEWED_WINDOW_SECONDS:
+            results.append({
+                "chat_id": chat_id, "ok": False,
+                "error": "this chat wasn't part of the current review batch",
+            })
             continue
         outcome = _escalate_chat(chat_id, reason)
         results.append({"chat_id": chat_id, **outcome})
