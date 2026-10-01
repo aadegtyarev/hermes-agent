@@ -193,11 +193,25 @@ def _escalate_chat(chat_id: str, message: str, message_id: str | None = None) ->
         wait = int(_ESCALATION_COOLDOWN_SECONDS - (now - last))
         return {"ok": True, "escalated": False, "reason": "cooldown", "retry_after_seconds": wait}
 
+    # message_id is model-supplied free text, interpolated into a MarkdownV2
+    # URL (_telegram_chat_deep_link). _md2_link's own escaping keeps it from
+    # changing the host, but a non-numeric value (stray space, newline) still
+    # produces a malformed link URL -> a MarkdownV2 parse error from Telegram
+    # -> _send below reports failure, same as any other delivery failure.
+    # Validating here instead gives a clearer, specific error immediately.
+    message_id = (message_id or "").strip()
+    if message_id and not message_id.isdigit():
+        message_id = None
+
     title = store.chat_title(chat_id) or chat_id
     link = _telegram_chat_deep_link(chat_id, message_id)
     chat_ref = _md2_link(title, link)
     text = f"Тебя зовут в чат {chat_ref}\\. {_md2_escape(message)}"
-    _send(team_chat, text, parse_mode="MarkdownV2")
+    if not _send(team_chat, text, parse_mode="MarkdownV2"):
+        # Deliberately NOT recording the escalation/burning the cooldown on a
+        # confirmed delivery failure — the whole point of checking _send's
+        # return value instead of assuming success. The caller can retry.
+        return {"ok": True, "escalated": False, "reason": "delivery_failed"}
     store.record_escalation(chat_id, now)
     return {"ok": True, "escalated": True, "team_chat": team_chat}
 

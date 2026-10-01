@@ -171,25 +171,43 @@ def _programs_for_user(uid: str) -> list[str]:
     return found
 
 
-def _send(chat_id: str, text: str, parse_mode: str | None = None) -> None:
+def _send(chat_id: str, text: str, parse_mode: str | None = None) -> bool:
     """Send a reply via the Bot API (used to ack admin commands + escalations).
 
     ``parse_mode="MarkdownV2"`` lets a caller compose a masked link
     (``[title](url)``, see ``_md2_link``) — plain by default so every
     existing ack call is unaffected.
+
+    Returns whether Telegram actually confirmed delivery (``"ok": true`` in
+    the response body), not just whether the HTTP request didn't raise.
+    Every existing admin-command ack call site ignores the return value
+    (acceptable there — a failed ack reply is a minor inconvenience, visible
+    to the operator who just typed the command), but escalate_to_team/
+    partner_flag_chats depend on this to avoid reporting a notification as
+    delivered — and burning the per-chat cooldown — when it silently wasn't
+    (a MarkdownV2 parse error, an oversized message, a 429, the bot having
+    been removed from the team chat, or a bad token all used to produce:
+    nothing delivered, caller told it succeeded, chat locked out of
+    escalating for the cooldown window, no retry).
     """
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     if not token or not chat_id:
-        return
+        return False
     try:
         payload = {"chat_id": chat_id, "text": text}
         if parse_mode:
             payload["parse_mode"] = parse_mode
         data = urllib.parse.urlencode(payload).encode()
-        urllib.request.urlopen(
-            f"https://api.telegram.org/bot{token}/sendMessage", data=data, timeout=8)
+        with urllib.request.urlopen(
+                f"https://api.telegram.org/bot{token}/sendMessage", data=data, timeout=8) as r:
+            result = json.loads(r.read().decode())
+        if not result.get("ok"):
+            logger.warning("telegram-context sendMessage rejected: %s", result.get("description"))
+            return False
+        return True
     except Exception as e:  # noqa: BLE001
         logger.warning("telegram-context sendMessage failed: %s", e)
+        return False
 
 
 _MD2_SPECIAL_RE = re.compile(r"([_*\[\]()~`>#+\-=|{}.!\\])")
