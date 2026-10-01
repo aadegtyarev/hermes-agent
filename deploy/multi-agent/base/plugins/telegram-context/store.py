@@ -323,6 +323,64 @@ def is_program_team_chat(chat_id: str) -> bool:
         ).fetchone() is not None
 
 
+def program_by_team_chat(chat_id: str) -> str | None:
+    """Reverse of program_chat_id: the program whose team chat is ``chat_id``."""
+    if not chat_id:
+        return None
+    with _conn() as c:
+        r = c.execute(
+            "SELECT program FROM partner_programs WHERE chat_id=?", (str(chat_id),)
+        ).fetchone()
+        return r["program"] if r else None
+
+
+def program_client_chats(program: str) -> list[dict]:
+    """Every client chat under ``program``, newest-activity first, each with
+    its title and activity/review metadata — the enumeration a program's team
+    chat needs to sweep or digest its clients top-down.
+    """
+    if not program:
+        return []
+    with _conn() as c:
+        rows = c.execute(
+            """SELECT ca.chat_id AS chat_id, ca.title AS title,
+                      MAX(m.ts) AS last_ts, COUNT(m.rowid) AS msg_count,
+                      crs.last_reviewed_ts AS last_reviewed_ts
+                 FROM chats_allowed ca
+                 LEFT JOIN messages m ON m.chat_id = ca.chat_id
+                 LEFT JOIN chat_review_state crs ON crs.chat_id = ca.chat_id
+                WHERE ca.mode='client' AND ca.program=?
+                GROUP BY ca.chat_id
+                ORDER BY last_ts DESC NULLS LAST""",
+            (program,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def search_in_chats(query: str, chat_ids: list[str], limit: int,
+                    since: float | None = None) -> list[dict]:
+    """FTS search over messages, restricted to a set of chat_ids (one query,
+    not one per chat). Returns matching messages newest-first."""
+    fts_query = _fts5_prefix_query(query)
+    if fts_query is None or not chat_ids:
+        return []
+    placeholders = ",".join("?" for _ in chat_ids)
+    where = f"messages_fts MATCH ? AND m.chat_id IN ({placeholders})"
+    args: list = [fts_query, *[str(c) for c in chat_ids]]
+    if since is not None:
+        where += " AND m.ts>=?"
+        args.append(since)
+    fetch_limit = max(1, min(int(limit), 500))
+    with _conn() as c:
+        rows = c.execute(
+            f"SELECT m.rowid, m.* FROM messages_fts "
+            f"JOIN messages m ON m.rowid = messages_fts.rowid "
+            f"WHERE {where} ORDER BY m.rowid DESC LIMIT ?",
+            [*args, fetch_limit],
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
 def remove_program_by_chat(chat_id: str) -> str | None:
     """Drop the program whose team chat is ``chat_id``. Returns its name, or None."""
     if not chat_id:
