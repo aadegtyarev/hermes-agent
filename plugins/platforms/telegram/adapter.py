@@ -7086,7 +7086,12 @@ class TelegramAdapter(BasePlatformAdapter):
         if not text or not self._bot or not getattr(self._bot, "username", None):
             return text
         username = re.escape(self._bot.username)
-        cleaned = re.sub(rf"(?i)@{username}\b[,:\-]*\s*", "", text).strip()
+        # Collapse the mention (plus any surrounding whitespace) to a single
+        # space rather than eating the trailing space. For a directed slash
+        # command "/cmd@botname arg" Telegram attaches "@botname" straight to
+        # the command token; dropping the following space would glue command
+        # and argument together ("/cmdarg"), so the command no longer parses.
+        cleaned = re.sub(rf"(?i)\s*@{username}\b[,:\-]*\s*", " ", text).strip()
         return cleaned or text
 
     def _should_observe_unmentioned_group_message(self, message: Message) -> bool:
