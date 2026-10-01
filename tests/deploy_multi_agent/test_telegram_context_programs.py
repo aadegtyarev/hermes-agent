@@ -19,7 +19,6 @@ import importlib.util
 import itertools
 import json
 import sys
-import types
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -54,30 +53,21 @@ def plugin(monkeypatch, tmp_path):
     monkeypatch.delenv("TELEGRAM_HOME_CHANNEL", raising=False)
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token")
 
+    # Loads the package exactly the way hermes_cli/plugins.py's real loader
+    # does (one spec, submodule_search_locations, registered at
+    # sys.modules[pkg_name] itself) — see test_telegram_context_plugin.py's
+    # fixture docstring for why this matters (a lazy cross-module import in
+    # tools.py only resolves correctly loaded this way).
     pkg_name = f"telegram_context_programs_under_test_{next(_counter)}"
-    pkg = types.ModuleType(pkg_name)
-    pkg.__path__ = [str(_PLUGIN_DIR)]
-    sys.modules[pkg_name] = pkg
-
-    store_spec = importlib.util.spec_from_file_location(
-        f"{pkg_name}.store", _PLUGIN_DIR / "store.py"
+    spec = importlib.util.spec_from_file_location(
+        pkg_name, _PLUGIN_DIR / "__init__.py",
+        submodule_search_locations=[str(_PLUGIN_DIR)],
     )
-    store_mod = importlib.util.module_from_spec(store_spec)
-    sys.modules[f"{pkg_name}.store"] = store_mod
-    store_spec.loader.exec_module(store_mod)
-
-    tools_mod = types.ModuleType(f"{pkg_name}.tools")
-    tools_mod.TOOLS = ()
-    tools_mod.BATCH_REVIEW_TOOLS = ()
-    sys.modules[f"{pkg_name}.tools"] = tools_mod
-
-    init_spec = importlib.util.spec_from_file_location(
-        f"{pkg_name}.__init__", _PLUGIN_DIR / "__init__.py"
-    )
-    mod = importlib.util.module_from_spec(init_spec)
+    mod = importlib.util.module_from_spec(spec)
     mod.__package__ = pkg_name
-    sys.modules[f"{pkg_name}.__init__"] = mod
-    init_spec.loader.exec_module(mod)
+    mod.__path__ = [str(_PLUGIN_DIR)]
+    sys.modules[pkg_name] = mod
+    spec.loader.exec_module(mod)
     mod.store.init()
 
     # membership: {chat_id: {uid: status}} — drives the fake getChatMember.
