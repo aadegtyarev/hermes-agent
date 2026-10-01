@@ -19,7 +19,6 @@ from __future__ import annotations
 import importlib.util
 import itertools
 import sys
-import types
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -35,48 +34,45 @@ _counter = itertools.count()
 @pytest.fixture
 def plugin(monkeypatch, tmp_path):
     """Load a fresh copy of the plugin module, with its own isolated
-    HERMES_HOME (so store.py's SQLite file never touches a real one) and a
-    stubbed `tools` submodule (tools.py pulls in tools.registry, core
-    plumbing unrelated to what's under test here).
+    HERMES_HOME (so store.py's SQLite file never touches a real one).
+
+    Loads the package EXACTLY the way hermes_cli/plugins.py's real loader
+    does — one importlib spec with submodule_search_locations, registered at
+    sys.modules[pkg_name] itself — rather than stubbing tools.py and
+    registering __init__.py's content at a separate '.__init__' key. An
+    earlier version of this fixture did the latter; it happened to work for
+    _pre_tool_call-only tests, but any code path reaching tools.py's lazy
+    `from . import _send, ...` (handle_escalate_to_team's cross-module
+    import) would NOT have resolved correctly under it — a real gap a
+    DIFFERENT test file's fixture was built to close, that this one quietly
+    still had. Unified so every test in this directory exercises the module
+    the same way production actually loads it.
 
     A unique module name per call keeps tests independent even though
     they share a subprocess (run_tests_parallel.py isolates per FILE, not
     per test function).
     """
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token")
     monkeypatch.delenv("TELEGRAM_READONLY_CHATS", raising=False)
     monkeypatch.delenv("TELEGRAM_HOME_CHANNEL", raising=False)
 
     pkg_name = f"telegram_context_under_test_{next(_counter)}"
-    pkg = types.ModuleType(pkg_name)
-    pkg.__path__ = [str(_PLUGIN_DIR)]
-    sys.modules[pkg_name] = pkg
-
-    store_spec = importlib.util.spec_from_file_location(
-        f"{pkg_name}.store", _PLUGIN_DIR / "store.py"
+    spec = importlib.util.spec_from_file_location(
+        pkg_name, _PLUGIN_DIR / "__init__.py",
+        submodule_search_locations=[str(_PLUGIN_DIR)],
     )
-    store_mod = importlib.util.module_from_spec(store_spec)
-    sys.modules[f"{pkg_name}.store"] = store_mod
-    store_spec.loader.exec_module(store_mod)
-
-    tools_mod = types.ModuleType(f"{pkg_name}.tools")
-    tools_mod.TOOLS = ()
-    tools_mod.BATCH_REVIEW_TOOLS = ()
-    sys.modules[f"{pkg_name}.tools"] = tools_mod
-
-    init_spec = importlib.util.spec_from_file_location(
-        f"{pkg_name}.__init__", _PLUGIN_DIR / "__init__.py"
-    )
-    mod = importlib.util.module_from_spec(init_spec)
+    mod = importlib.util.module_from_spec(spec)
     mod.__package__ = pkg_name
-    sys.modules[f"{pkg_name}.__init__"] = mod
-    init_spec.loader.exec_module(mod)
+    mod.__path__ = [str(_PLUGIN_DIR)]
+    sys.modules[pkg_name] = mod
+    spec.loader.exec_module(mod)
     mod.store.init()
 
     yield mod
 
     for key in list(sys.modules):
-        if key.startswith(pkg_name):
+        if key == pkg_name or key.startswith(pkg_name + "."):
             del sys.modules[key]
 
 
@@ -240,6 +236,22 @@ def test_sync_core_read_only_was_removed(plugin):
     also gates core dispatch, which is what caused the /hermes_forget
     lockout this test file exists to prevent."""
     assert not hasattr(plugin, "_sync_core_read_only")
+
+
+def test_fixture_loads_the_real_tools_module_not_a_stub(plugin):
+    """Regression guard for the fixture-consistency gap an adversarial
+    review found: this file and test_telegram_context_programs.py used to
+    stub tools.py to an empty TOOLS/BATCH_REVIEW_TOOLS tuple and register
+    __init__.py's content at the wrong sys.modules key — which happened to
+    work for _pre_tool_call-only tests, but would NOT have exercised
+    tools.py's lazy `from . import _send, ...` cross-module import
+    (handle_escalate_to_team) correctly. Both fixtures now load the package
+    exactly the way production does; this just confirms plugin.T is the
+    real module, not a stub, so that gap can't silently reopen."""
+    assert hasattr(plugin.T, "handle_escalate_to_team")
+    assert hasattr(plugin.T, "handle_partner_flag_chats")
+    assert len(plugin.T.TOOLS) > 0
+    assert len(plugin.T.BATCH_REVIEW_TOOLS) > 0
 
 
 def test_register_installs_the_pre_tool_call_hook(plugin, monkeypatch):
