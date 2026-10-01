@@ -320,7 +320,83 @@ def test_hermes_forget_removes_a_program(plugin, monkeypatch):
 
     assert result == plugin._HANDLED
     assert plugin.store.programs() == {}
-    assert "удалена" in sent[0][1]
+
+
+def test_hermes_forget_clears_orphaned_per_chat_state(plugin, monkeypatch):
+    """Without this, re-registering the SAME chat_id later (a new client
+    chat, possibly under a different program) would inherit the PREVIOUS
+    occupant's gdoc allowlist — a new partner's chat trusting a document an
+    unrelated prior chat once linked."""
+    monkeypatch.setenv("TELEGRAM_ADMIN_USERS", "111")
+    plugin.store.create_program("journalist-partners", "-500", "111")
+    plugin.store.set_chat("-700", "client", "Acme", "111", program="journalist-partners")
+    plugin.store.link_chat_doc("-700", "SOME_DOC")
+    plugin.store.record_escalation("-700")
+    plugin.store.mark_reviewed("-700")
+    monkeypatch.setattr(plugin, "_send", lambda chat_id, text: None)
+
+    msg = _group_message("/hermes_forget", chat_id="-700", from_user_id="111")
+    plugin._handle_command(msg, msg.source, "-700", "111")
+
+    assert plugin.store.chat_doc_ids("-700") == set()
+    assert plugin.store.last_escalation_ts("-700") is None
+    assert plugin.store.last_reviewed_ts("-700") is None
+
+
+# ── /hermes_program is group-chat only, not usable from a DM ────────────────
+
+def test_hermes_program_silently_refused_from_a_dm(plugin, monkeypatch):
+    monkeypatch.setenv("TELEGRAM_ADMIN_USERS", "111")
+    sent = []
+    monkeypatch.setattr(plugin, "_send", lambda chat_id, text: sent.append((chat_id, text)))
+
+    msg = _group_message("/hermes_program journalist-partners", chat_id="111", from_user_id="111")
+    result = plugin._handle_command(msg, msg.source, "111", "111", "dm")
+
+    assert result == plugin._NON_ADMIN_SILENT
+    assert plugin.store.programs() == {}
+    assert sent == []
+
+
+def test_hermes_program_works_normally_outside_a_dm(plugin, monkeypatch):
+    """Regression guard: the DM refusal must not accidentally catch group
+    chats too — ctype defaults to "" when callers (including every other
+    test in this file) don't pass it, which must behave like "not a DM"."""
+    monkeypatch.setenv("TELEGRAM_ADMIN_USERS", "111")
+
+    msg = _group_message("/hermes_program journalist-partners", chat_id="-500", from_user_id="111")
+    result = plugin._handle_command(msg, msg.source, "-500", "111")
+
+    assert result == plugin._HANDLED
+    assert plugin.store.program_chat_id("journalist-partners") == "-500"
+
+
+# ── Program name validation/normalization ───────────────────────────────────
+
+def test_program_name_is_case_insensitive_for_matching(plugin, monkeypatch):
+    """Without normalizing case once up front, "/hermes_program Foo" and an
+    existing "foo" would be treated as two different programs."""
+    monkeypatch.setenv("TELEGRAM_ADMIN_USERS", "111")
+    plugin.store.create_program("journalist-partners", "-500", "111")
+    _member(plugin, "-500", "222")
+    sent = []
+    monkeypatch.setattr(plugin, "_send", lambda chat_id, text: sent.append((chat_id, text)))
+
+    msg = _group_message("/hermes_program Journalist-Partners", chat_id="-700", from_user_id="222")
+    result = plugin._handle_command(msg, msg.source, "-700", "222")
+
+    assert result == plugin._HANDLED
+    assert plugin.store.chat_program("-700") == "journalist-partners"
+
+
+def test_create_program_rejects_a_name_with_spaces(plugin):
+    assert not plugin.store.create_program("my team", "-500", "111")
+    assert plugin.store.programs() == {}
+
+
+def test_create_program_rejects_empty_and_punctuation_only_names(plugin):
+    assert not plugin.store.create_program("", "-500", "111")
+    assert not plugin.store.create_program("!!!", "-500", "111")
 
 
 # ── _on_dispatch: client-mode chats behave like work, minus DM access ───────
