@@ -356,7 +356,7 @@ def test_dedupe_cron_jobs_keeps_only_the_oldest(plugin):
 # SessionDB, so these tests fake that class rather than standing up a real one.
 
 class _FakeSessionDB:
-    """Maps session_id -> chat_id for _origin_chat_id, set per test via _SESSIONS."""
+    """Maps session_id -> chat_id for origin_chat_id, set per test via _SESSIONS."""
     _SESSIONS: dict[str, str] = {}
 
     def __init__(self, read_only: bool = False):
@@ -364,7 +364,10 @@ class _FakeSessionDB:
 
     def get_session(self, session_id):
         chat_id = self._SESSIONS.get(session_id)
-        return {"chat_id": chat_id} if chat_id is not None else None
+        return {"chat_id": chat_id, "source": "telegram", "parent_session_id": None} if chat_id is not None else None
+
+    def close(self):
+        pass
 
 
 @pytest.fixture
@@ -432,14 +435,19 @@ def test_session_search_fully_blocked_from_client_chat(plugin, fake_session_db):
     assert result is not None and result["action"] == "block"
 
 
-def test_send_message_to_own_chat_allowed_from_client_chat(plugin, fake_session_db):
+def test_send_message_blocked_entirely_from_client_chat_even_to_its_own_chat(plugin, fake_session_db):
+    """send_message isn't on the client-chat allowlist at all — the only
+    legitimate way out is escalate_to_team. Blocking it unconditionally
+    (rather than special-casing "but your own chat is fine") means there's
+    no separate code path to keep correct, and matches reality in this
+    deployment anyway: send_message isn't an agent-callable tool here."""
     _client_session(plugin, fake_session_db, "sess-1", "-700")
 
     result = plugin._pre_tool_call(
         tool_name="send_message", args={"target": "telegram:-700", "message": "hi"}, session_id="sess-1",
     )
 
-    assert result is None
+    assert result is not None and result["action"] == "block"
 
 
 def test_send_message_to_a_different_chat_blocked_from_client_chat(plugin, fake_session_db):
@@ -580,3 +588,66 @@ def test_gdoc_tools_unaffected_from_work_chats(plugin, fake_session_db):
         tool_name="gdoc_read", args={"url": "https://docs.google.com/document/d/ANY/edit"},
         session_id="sess-2",
     ) is None
+
+
+# ── Allowlist regression guards: bypass vectors an adversarial review found
+# in the earlier denylist design — each of these must now be blocked by
+# DEFAULT (not available, not thought of) rather than requiring a dedicated
+# per-tool guard to have been written and kept current.
+
+@pytest.mark.parametrize("tool_name,args", [
+    ("telegram_thread", {"message_id": "5", "chat_id": "-999"}),
+    ("telegram_dm_allowlist", {}),
+    ("session_search", {"query": "anything"}),
+    ("gdrive_search", {"query": "anything"}),
+    ("gsheet_read", {"url": "https://docs.google.com/spreadsheets/d/ANY/edit"}),
+    ("terminal", {"command": "cat /opt/data/telegram.db"}),
+    ("code_execution", {"code": "print(1)"}),
+    ("file", {"action": "read", "path": "/opt/data/telegram.db"}),
+    ("read_file", {"path": "/opt/data/telegram.db"}),
+    ("cronjob", {"action": "create", "deliver": "telegram:-800", "prompt": "x", "schedule": "1m"}),
+    ("delegate_task", {"goal": "search every telegram chat for X"}),
+    ("ssh_connect", {"host": "example.com"}),
+    ("memory", {"action": "search", "query": "x"}),
+    ("send_message", {"target": "telegram:-700"}),
+    ("some_future_tool_nobody_has_written_yet", {}),
+])
+def test_default_deny_blocks_every_tool_not_on_the_allowlist(plugin, fake_session_db, tool_name, args):
+    """Regression guard for the adversarial-review findings: a denylist has
+    to enumerate every dangerous tool correctly and stay current forever; an
+    allowlist is safe by construction against tools nobody thought to list.
+    Each of these was a real, verified bypass of the OLD denylist design."""
+    _client_session(plugin, fake_session_db, "sess-1", "-700")
+
+    result = plugin._pre_tool_call(tool_name=tool_name, args=args, session_id="sess-1")
+
+    assert result is not None and result["action"] == "block", f"{tool_name} was NOT blocked"
+
+
+@pytest.mark.parametrize("tool_name,args", [
+    ("clarify", {"question": "which site?"}),
+    ("escalate_to_team", {"message": "need help"}),
+    ("web_search", {"query": "anything"}),
+    ("web_extract", {"url": "https://example.com"}),
+    ("vision_analyze", {"image_url": "https://example.com/photo.jpg"}),
+])
+def test_allowlisted_tools_pass_through_from_client_chat(plugin, fake_session_db, tool_name, args):
+    """The flip side of the denylist guard above: the short allowed list
+    itself must still actually work (these aren't chat/doc-scoped, so no
+    further restriction applies — just confirming they're not accidentally
+    swept up by the default-deny)."""
+    _client_session(plugin, fake_session_db, "sess-1", "-700")
+
+    result = plugin._pre_tool_call(tool_name=tool_name, args=args, session_id="sess-1")
+
+    assert result is None, f"{tool_name} was unexpectedly blocked: {result}"
+
+
+def test_allowlist_does_not_apply_to_work_or_readonly_chats(plugin, fake_session_db):
+    """The one-directional guarantee must hold for tools newly covered by the
+    allowlist too, not just the previously-guarded ones."""
+    plugin.store.set_chat("-800", "work", "", "111")
+    fake_session_db._SESSIONS["sess-2"] = "-800"
+
+    for tool_name in ("terminal", "cronjob", "delegate_task", "telegram_thread", "gsheet_read"):
+        assert plugin._pre_tool_call(tool_name=tool_name, args={}, session_id="sess-2") is None

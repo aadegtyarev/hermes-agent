@@ -152,8 +152,23 @@ def _user_is_member_of_chat(uid: str, chat_id: str) -> bool:
 
 
 def _programs_for_user(uid: str) -> list[str]:
-    """Which registered programs' team chats ``uid`` is currently a live member of."""
-    return [p for p, chat in store.programs().items() if _user_is_member_of_chat(uid, chat)]
+    """Which registered programs' team chats ``uid`` is currently a live member of.
+
+    Stops at 2 matches: every caller of this only distinguishes "none" /
+    "exactly one" / "two or more (ambiguous)" — it never needs the full set.
+    Each check is a synchronous getChatMember HTTP call (8s timeout) made
+    from inside the dispatch hook; with N registered programs a naive full
+    scan is O(N) blocking HTTP round-trips on every bare ``/hermes_program``.
+    Capping at 2 bounds the worst case to 2 round-trips once ambiguity is
+    already established, regardless of how many programs exist.
+    """
+    found: list[str] = []
+    for p, chat in store.programs().items():
+        if _user_is_member_of_chat(uid, chat):
+            found.append(p)
+            if len(found) >= 2:
+                break
+    return found
 
 
 def _send(chat_id: str, text: str, parse_mode: str | None = None) -> None:
@@ -297,7 +312,16 @@ def _handle_hermes_program(chat_id: str, uid: str, title: str, raw_text: str):
     either about to become registered or already is one of ours — never
     leaking usage help into an unrelated chat.
     """
-    if store.chat_mode(chat_id) or store.is_program_team_chat(chat_id):
+    # chat_mode() only sees the runtime store — a chat configured via the
+    # static TELEGRAM_WORK_CHATS/TELEGRAM_READONLY_CHATS env vars is invisible
+    # to it. Without checking those too, a non-global-admin program member
+    # could register an env-configured read-only chat as a responding client
+    # chat (silently lifting the operator's observe-only setting), or
+    # register an env-configured work chat as client-mode (silently applying
+    # the client-chat tool allowlist to the team's own main chat — a
+    # non-admin denial-of-service against the team's assistant).
+    if (store.chat_mode(chat_id) or store.is_program_team_chat(chat_id)
+            or chat_id in _work_chats() or chat_id in _readonly_chats()):
         _send(chat_id, "Этот чат уже зарегистрирован.")
         return _HANDLED
 
@@ -491,9 +515,39 @@ def _dm_allowed(uid: str) -> bool:
 
 _TELEGRAM_TARGET_CHAT_RE = re.compile(r"^\s*telegram(?::(-?\d+))?(?::\d+)?\s*$", re.IGNORECASE)
 
-# Tools whose cross-chat reach must be cut off for a client-mode chat's own
-# session — see _pre_tool_call's docstring for why each one is here.
-_CROSS_CHAT_READ_TOOLS = {"telegram_search", "telegram_recent"}
+# ALLOWLIST, not denylist. A client-mode chat's session may call ONLY these
+# tools — everything else (including every tool this plugin has never heard
+# of, and every tool added to the agent's toolset in the future) is blocked
+# by default. This replaced an earlier denylist (block session_search,
+# gdrive_search, ...) after an adversarial review found it was trivially
+# bypassed: the telegram platform session also carries terminal/
+# code_execution/file (direct shell/filesystem access to telegram.db itself),
+# cronjob (delivers to an arbitrary chat_id or "all" channels), delegate_task
+# (a subagent's own session has no chat_id at all, so EVERY guard silently
+# no-ops for it), telegram_thread and telegram_dm_allowlist (neither was ever
+# added to the old per-tool denylist), and gsheet_read (same Drive
+# credentials as gdoc_read, no guard at all). A denylist has to enumerate
+# every dangerous tool correctly and stay current as toolsets grow; an
+# allowlist is safe by construction against tools nobody thought to block.
+#
+# Deliberately conservative — exactly what a "full assistant" persona needs
+# per the brief (answer questions, read documents shared in-chat, look at
+# images, search the public web, ask a follow-up, escalate) and nothing more.
+# Widen only with a specific, stated need (see AGENTS.md's Footprint Ladder).
+_CLIENT_CHAT_ALLOWED_TOOLS = {
+    "clarify",
+    "escalate_to_team",
+    "gdoc_read",
+    "gdoc_comments",
+    "telegram_search",
+    "telegram_recent",
+    "web_search",
+    "web_extract",
+    "vision_analyze",
+}
+# Of the above, these need EXTRA scoping even though they're allowed at all.
+_CLIENT_CHAT_SCOPED_READ_TOOLS = {"telegram_search", "telegram_recent"}
+_CLIENT_CHAT_SCOPED_GDOC_TOOLS = {"gdoc_read", "gdoc_comments"}
 
 # Mirrors google-docs/tools.py's own _DOC_ID_RE — duplicated rather than
 # imported so this plugin's isolation guard has no hard dependency on the
@@ -513,50 +567,45 @@ def _parse_gdoc_id(ref: str) -> str:
 
 
 def _pre_tool_call(tool_name=None, args=None, **kwargs):
-    """Two independent hard guarantees, both keyed on chat mode, not on prompting:
+    """Two independent guarantees, both keyed on chat mode, not on prompting:
 
     1. ``send_message`` aimed at a read-only chat is blocked outright — the
-       actual "never writes there, no matter what" guarantee. ``pre_gateway_
-       dispatch`` (the gate in ``_on_dispatch`` below) only ever stops the
-       agent from getting a *turn* for a message that arrived FROM a
-       read-only chat; it says nothing about the agent later choosing (or
-       being prompt-injected into choosing, from an entirely different
-       conversation) to explicitly ``send_message`` there. ``send_message``'s
-       ``target`` is a documented, unambiguous ``"platform:chat_id[:thread_id]"``
-       string (tools/send_message_tool.py) — cheap and reliable to match here
-       without needing to touch core or duplicate the tool's own resolution
-       logic.
+       actual "never writes there, no matter what" guarantee, independent of
+       dispatch gating (which only ever governs whether the agent gets a
+       *turn* for an inbound message, not what it later chooses, or is
+       prompt-injected into choosing, to explicitly send). Applies to every
+       session regardless of chat mode — a work-chat session must not be
+       able to write into a read-only chat either.
 
        An earlier version tried to get this guarantee by mirroring this
-       plugin's readonly set into the core adapter's ``read_only_chats`` (a
-       send-level guard hermes-agent core offers for static ``config.yaml``
-       use) — that backfired: the core field ALSO gates dispatch, so once
-       mirrored, read-only chats silently stopped reaching this plugin's
-       ``_on_dispatch`` at all, including admin commands like
-       ``/hermes_forget`` typed from inside that chat. Blocking at the
-       tool-call boundary instead needs no core changes at all.
+       plugin's readonly set into the core adapter's ``read_only_chats`` —
+       that backfired (gates dispatch too, silently blocking admin commands
+       from inside that chat). Blocking at the tool-call boundary needs no
+       core changes.
 
-    2. A **client-mode chat's own session** may never reach outside itself:
-       ``send_message`` may only target its OWN chat (the only legitimate way
-       out is a dedicated escalation tool, landing in a follow-up PR — not
-       ``send_message`` to an arbitrary chat_id); ``telegram_search``/
-       ``telegram_recent`` may only be scoped to its own chat_id (omitting
-       chat_id, or passing a different one, is blocked rather than silently
-       narrowed — a silent rewrite would hide the restriction from the model
-       instead of teaching it the right call); ``session_search`` is blocked
-       outright (it's a cross-session discovery tool with no per-chat scoping
-       at all — nothing a client-chat assistant legitimately needs). Work and
-       read-only chats are completely unaffected — this whole guarantee is
-       ONE-DIRECTIONAL: it isolates a client chat's own session from seeing
-       anything else, it does not stop a work-chat session from reading a
-       client chat's history (that cross-read is intentional — see the
-       registry's module docstring).
+    2. A **client-mode chat's own session** may call ONLY the tools in
+       ``_CLIENT_CHAT_ALLOWED_TOOLS`` — an allowlist, not a denylist (see
+       that constant's own comment for why). ``telegram_search``/
+       ``telegram_recent`` must additionally be scoped to the chat's own
+       chat_id (omitting it, or passing a different one, is blocked rather
+       than silently narrowed — a silent rewrite would hide the restriction
+       from the model instead of teaching it the right call);
+       ``gdoc_read``/``gdoc_comments`` must additionally be scoped to a
+       doc_id that has actually appeared in this chat's own history.
 
-       Resolving "which chat is this session in" needs ``store.origin_chat_id``
-       (see its docstring) since chat_id isn't part of the hook's own
-       kwargs — only checked for the specific tool names above, so every
-       other tool call (the overwhelming majority) exits on the first line
-       below with no lookup at all.
+       This guarantee is ONE-DIRECTIONAL: it isolates a client chat's own
+       session from reaching anything else; it does not restrict a
+       work/read-only chat's session (that cross-read is intentional — see
+       the registry's module docstring).
+
+       Resolving "which chat is this session in" needs
+       ``store.origin_chat_id`` (see its docstring — follows
+       ``parent_session_id`` through mid-turn context compression, fails
+       CLOSED... well, fails to "unknown" on any error, same as a
+       CLI/non-Telegram session) since chat_id isn't part of the hook's own
+       kwargs. Checked once per call, cheaply, before the allowlist check —
+       a session that isn't (or can't be confirmed to be) client-mode skips
+       straight to ``return None`` with no further work.
     """
     if tool_name == "send_message":
         target = str((args or {}).get("target") or "").strip()
@@ -570,62 +619,44 @@ def _pre_tool_call(tool_name=None, args=None, **kwargs):
                 "message": f"Chat {target_chat_id} is read-only — this bot never writes there. "
                            "Not something to work around; pick a different target or drop the send.",
             }
-        origin_chat = store.origin_chat_id(kwargs.get("session_id") or "")
-        if origin_chat and store.chat_mode(origin_chat) == "client":
-            if not target_chat_id or str(target_chat_id) != str(origin_chat):
-                return {
-                    "action": "block",
-                    "message": "This is an isolated client chat — send_message may only target "
-                               "this same chat. There is no cross-chat messaging from here.",
-                }
-        return None
+        # Falls through to the client-chat allowlist below (send_message
+        # isn't in it — blocked for a client-chat session the same as any
+        # other non-allowlisted tool, no special case needed here).
 
-    if tool_name in _CROSS_CHAT_READ_TOOLS:
-        origin_chat = store.origin_chat_id(kwargs.get("session_id") or "")
-        if origin_chat and store.chat_mode(origin_chat) == "client":
-            requested = str((args or {}).get("chat_id") or "").strip()
-            if requested != str(origin_chat):
-                return {
-                    "action": "block",
-                    "message": f"This is an isolated client chat — {tool_name} only works scoped "
-                               f"to its own history. Pass chat_id='{origin_chat}' explicitly.",
-                }
-        return None
+    origin_chat = store.origin_chat_id(kwargs.get("session_id") or "")
+    if not origin_chat or store.chat_mode(origin_chat) != "client":
+        return None  # not a confirmed client-chat session — no restriction
 
-    if tool_name == "session_search":
-        origin_chat = store.origin_chat_id(kwargs.get("session_id") or "")
-        if origin_chat and store.chat_mode(origin_chat) == "client":
+    if tool_name not in _CLIENT_CHAT_ALLOWED_TOOLS:
+        return {
+            "action": "block",
+            "message": f"'{tool_name}' isn't available in this chat — it's an isolated client "
+                       "chat with a short allowed list. If you genuinely need something outside "
+                       "it, use escalate_to_team instead of working around this.",
+        }
+
+    if tool_name in _CLIENT_CHAT_SCOPED_READ_TOOLS:
+        requested = str((args or {}).get("chat_id") or "").strip()
+        if requested != str(origin_chat):
             return {
                 "action": "block",
-                "message": "session_search isn't available in this chat — it's an isolated "
-                           "client chat with no cross-session access.",
+                "message": f"This is an isolated client chat — {tool_name} only works scoped "
+                           f"to its own history. Pass chat_id='{origin_chat}' explicitly.",
             }
         return None
 
-    if tool_name == "gdrive_search":
-        origin_chat = store.origin_chat_id(kwargs.get("session_id") or "")
-        if origin_chat and store.chat_mode(origin_chat) == "client":
+    if tool_name in _CLIENT_CHAT_SCOPED_GDOC_TOOLS:
+        doc_id = _parse_gdoc_id(str((args or {}).get("url") or ""))
+        if not doc_id or doc_id not in store.chat_doc_ids(origin_chat):
             return {
                 "action": "block",
-                "message": "gdrive_search isn't available in this chat — only documents already "
-                           "shared here can be opened with gdoc_read; nothing can be searched for.",
+                "message": "This is an isolated client chat — gdoc_read/gdoc_comments only "
+                           "work for a document already shared in THIS chat's own history. "
+                           "That document hasn't appeared here.",
             }
         return None
 
-    if tool_name in ("gdoc_read", "gdoc_comments"):
-        origin_chat = store.origin_chat_id(kwargs.get("session_id") or "")
-        if origin_chat and store.chat_mode(origin_chat) == "client":
-            doc_id = _parse_gdoc_id(str((args or {}).get("url") or ""))
-            if not doc_id or doc_id not in store.chat_doc_ids(origin_chat):
-                return {
-                    "action": "block",
-                    "message": "This is an isolated client chat — gdoc_read/gdoc_comments only "
-                               "work for a document already shared in THIS chat's own history. "
-                               "That document hasn't appeared here.",
-                }
-        return None
-
-    return None
+    return None  # clarify / escalate_to_team / web_search / web_extract / vision_analyze: unscoped
 
 
 def _on_dispatch(event=None, gateway=None, session_store=None, **kwargs):
