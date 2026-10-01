@@ -434,3 +434,31 @@ def test_work_chat_membership_unaffected_by_client_chats_existing(plugin):
     plugin._on_dispatch(event=msg, gateway=None, session_store=None)
 
     assert plugin.store.is_dm_allowed("444")
+
+
+def test_program_team_chat_responds_like_a_work_chat(plugin):
+    """The program's own team chat (lives only in partner_programs, never in
+    chats_allowed) must dispatch like a work chat — the team talks to the bot
+    there and escalations land there — not fall through to the final skip."""
+    # Some OTHER chats are configured, so the "unconfigured — allow all" branch
+    # does not apply; the team chat must match on its own.
+    plugin.store.set_chat("-900", "work", "", "111")
+    plugin.store.create_program("journalist-partners", "-500", "111")
+
+    msg = _group_message("что у нас сегодня в клиентских чатиках было?",
+                         chat_id="-500", from_user_id="111")
+    result = plugin._on_dispatch(event=msg, gateway=None, session_store=None)
+
+    assert result is None  # responds (core require_mention still gates the turn)
+    assert plugin.store.is_dm_allowed("111")  # team member gets DM access, like work
+
+
+def test_program_team_chat_messages_are_ingested(plugin):
+    plugin.store.set_chat("-900", "work", "", "111")
+    plugin.store.create_program("journalist-partners", "-500", "111")
+
+    msg = _group_message("team note", chat_id="-500", from_user_id="111")
+    plugin._on_dispatch(event=msg, gateway=None, session_store=None)
+
+    page = plugin.store.recent("-500", 10)
+    assert [m["text"] for m in page["messages"]] == ["team note"]
