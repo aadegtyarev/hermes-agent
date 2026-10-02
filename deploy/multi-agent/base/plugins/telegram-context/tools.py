@@ -178,7 +178,7 @@ def _escalate_chat(chat_id: str, message: str, message_id: str | None = None) ->
     """
     # Lazy import: avoids a circular import at module-load time (__init__.py
     # imports this module at its own top level).
-    from . import _md2_escape, _md2_link, _send, _telegram_chat_deep_link
+    from . import _get_invite_link, _md2_escape, _md2_link, _send, _telegram_chat_deep_link
 
     if not chat_id or store.chat_mode(chat_id) != "client":
         return {"ok": False, "error": f"{chat_id} is not a registered client chat."}
@@ -209,9 +209,24 @@ def _escalate_chat(chat_id: str, message: str, message_id: str | None = None) ->
         message_id = None
 
     title = store.chat_title(chat_id) or chat_id
-    link = _telegram_chat_deep_link(chat_id, message_id)
-    chat_ref = _md2_link(title, link)
-    text = f"Тебя зовут в чат {chat_ref}\\. {_md2_escape(message)}"
+    invite = _get_invite_link(chat_id)
+    deep_link = _telegram_chat_deep_link(chat_id, message_id)
+
+    # Two DIFFERENT links, deliberately not interchangeable: "вступить" next
+    # to the name joins the chat even for someone who isn't a member yet
+    # (works off a Bot-API invite link or one found in the chat's own
+    # description — see _get_invite_link's docstring); the line below jumps
+    # straight to the specific message, but only resolves for someone who's
+    # ALREADY a member (Telegram's deep-link behavior, not something this
+    # plugin can change) — keeping both means either audience is covered.
+    name_part = _md2_escape(title)
+    if invite:
+        name_part += f" \\({_md2_link('вступить', invite)}\\)"
+    lines = [f"Тебя зовут в чат {name_part}\\."]
+    if deep_link:
+        lines.append(_md2_link("Ссылка на сообщение", deep_link))
+    lines.append(_md2_escape(message))
+    text = "\n".join(lines)
     if not _send(team_chat, text, parse_mode="MarkdownV2"):
         # Deliberately NOT recording the escalation/burning the cooldown on a
         # confirmed delivery failure — the whole point of checking _send's

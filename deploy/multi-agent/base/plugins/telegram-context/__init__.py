@@ -54,6 +54,8 @@ TELEGRAM_ADMIN_USERS can enrol the current chat with a command — no file edits
   /hermes_chats            → show the runtime list (with per-program client-chat counts)
   /hermes_program_rename   → rename a program, from inside its own team chat
   /hermes_program_move     → re-point a program's team chat to the current (fresh) chat
+  /hermes_invite_link      → force a fresh invite link for a client chat (own team-member
+                             trust, not global-admin-only — see _handle_invite_link_regenerate)
 Commands are handled in the hook (before gating, so they work in a not-yet-enrolled
 chat), acknowledged via Bot API, and never forwarded to the agent. Commands reach the
 bot even with group privacy mode on (`/cmd@Bot`); full ingest still needs privacy off.
@@ -250,9 +252,108 @@ def _telegram_chat_deep_link(chat_id: str, message_id: str | None = None) -> str
     return f"https://t.me/c/{internal_id}/{message_id or 1}"
 
 
+_INVITE_LINK_RE = re.compile(r"https?://t\.me/(?:\+|joinchat/)[\w-]+")
+_GENERIC_TME_LINK_RE = re.compile(r"https?://t\.me/\S+")
+
+
+def _extract_invite_link_from_text(text: str) -> str | None:
+    """Pull a usable Telegram link out of free text (a chat's own
+    description). Prefers an actual invite-link shape (``t.me/+...`` /
+    ``t.me/joinchat/...``) over a plain public-username link, but falls back
+    to any ``t.me/...`` link found — a human just pasted SOMETHING clickable
+    that reaches the chat, not necessarily Telegram's own invite-link format."""
+    if not text:
+        return None
+    m = _INVITE_LINK_RE.search(text)
+    if m:
+        return m.group(0).rstrip(').,;')
+    m = _GENERIC_TME_LINK_RE.search(text)
+    if m:
+        return m.group(0).rstrip(').,;')
+    return None
+
+
+def _create_chat_invite_link(chat_id: str) -> str | None:
+    """Ask Telegram for a NEW invite link for ``chat_id`` — succeeds only if
+    the bot is an admin there with the "invite users" right. Deliberately
+    ``createChatInviteLink``, not ``exportChatInviteLink``: the latter
+    REVOKES the chat's existing primary invite link every single time it's
+    called, which would silently break a link a human admin already shared
+    or pinned; ``createChatInviteLink`` only ever ADDS a new, independent
+    link alongside whatever already exists.
+
+    No ``expire_date``/``member_limit`` is passed — the link this returns
+    must never expire or run out of uses (by design: it's meant to be
+    created once, cached forever, and handed out indefinitely), and leaving
+    both unset is exactly how the Bot API produces that."""
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    if not token or not chat_id:
+        return None
+    try:
+        payload = urllib.parse.urlencode({"chat_id": chat_id, "name": "hermes-auto"}).encode()
+        with urllib.request.urlopen(
+                f"https://api.telegram.org/bot{token}/createChatInviteLink",
+                data=payload, timeout=8) as r:
+            result = json.loads(r.read().decode())
+        if result.get("ok"):
+            return (result.get("result") or {}).get("invite_link")
+        logger.info("telegram-context: createChatInviteLink unavailable for %s (likely not "
+                    "an admin there): %s", chat_id, result.get("description"))
+        return None
+    except Exception as e:  # noqa: BLE001
+        logger.warning("telegram-context: createChatInviteLink failed for %s: %s", chat_id, e)
+        return None
+
+
+def _get_chat_description(chat_id: str) -> str | None:
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    if not token or not chat_id:
+        return None
+    try:
+        url = f"https://api.telegram.org/bot{token}/getChat?chat_id={urllib.parse.quote(str(chat_id))}"
+        with urllib.request.urlopen(url, timeout=8) as r:
+            result = json.loads(r.read().decode())
+        return (result.get("result") or {}).get("description") if result.get("ok") else None
+    except Exception as e:  # noqa: BLE001
+        logger.warning("telegram-context: getChat failed for %s: %s", chat_id, e)
+        return None
+
+
+def _get_invite_link(chat_id: str) -> str | None:
+    """A joinable link for ``chat_id``, usable by someone NOT already a
+    member — unlike :func:`_telegram_chat_deep_link`, which only resolves for
+    an existing member (and is useless if the chat also hides its history
+    from new joiners, since a non-member can't open it at all).
+
+    Two sources, tried in order:
+    1. A bot-generated invite link, if the bot is an admin there — created
+       ONCE via the Bot API and cached in the store forever after (see
+       ``store.chat_invite_links``' own docstring for why only this branch
+       is cached). Retried fresh on every call this DOESN'T succeed, since a
+       bot's admin status can change later (e.g. a human promotes it) and
+       this should start producing a stored link the moment that happens,
+       with no restart needed.
+    2. The chat's own ``description``, scanned for a link a human already
+       put there — the fallback for the far more common case (the bot was
+       only ever added as a regular member of a partner's own group). NOT
+       cached — a human can edit the description at any time, so this is
+       re-read fresh on every lookup instead of going stale.
+    """
+    if not chat_id:
+        return None
+    cached = store.get_cached_invite_link(chat_id)
+    if cached:
+        return cached
+    link = _create_chat_invite_link(chat_id)
+    if link:
+        store.set_cached_invite_link(chat_id, link)
+        return link
+    return _extract_invite_link_from_text(_get_chat_description(chat_id) or "")
+
+
 _CHAT_COMMANDS = {
     "/hermes_here", "/hermes_readonly", "/hermes_forget", "/hermes_chats", "/hermes_program",
-    "/hermes_program_rename", "/hermes_program_move",
+    "/hermes_program_rename", "/hermes_program_move", "/hermes_invite_link",
 }
 # Gated on global TELEGRAM_ADMIN_USERS. /hermes_program is NOT in this set —
 # it has its own contextual auth (see _handle_hermes_program): creating a new
@@ -281,6 +382,7 @@ _MENU_COMMANDS = (
     ("hermes_program", "Создать программу / зарегистрировать клиентский чат"),
     ("hermes_program_rename", "Переименовать программу (из её чата команды)"),
     ("hermes_program_move", "Перенести чат команды программы в этот чат"),
+    ("hermes_invite_link", "Перевыпустить инвайт-ссылку клиентского чата"),
 )
 
 
@@ -444,8 +546,22 @@ def _handle_hermes_program(chat_id: str, uid: str, title: str, raw_text: str):
         store.set_chat(chat_id, "client", title, uid, program=program_name)
         _send(chat_id, f"✅ Чат зарегистрирован как клиентский под программой «{program_name}».")
         team_chat = progs.get(program_name) or store.program_chat_id(program_name)
-        _send(team_chat, f"➕ Добавлен новый клиентский чат под «{program_name}»: "
-              f"{title or chat_id} (добавил uid={uid}).")
+        # Plain text (no parse_mode) -> a bare URL auto-links in Telegram, no
+        # masking needed here (unlike the MarkdownV2 escalation message in
+        # tools.py's _escalate_chat, which needs _md2_link for the same two
+        # links). "вступить" next to the name is the join link (works for
+        # someone not yet a member — see _get_invite_link's own docstring for
+        # why that's not the same as the deep link below); the deep link on
+        # its own line jumps straight to the chat for anyone already in it.
+        invite = _get_invite_link(chat_id)
+        name_part = title or chat_id
+        if invite:
+            name_part += f" (вступить: {invite})"
+        notice = f"➕ Добавлен новый клиентский чат под «{program_name}»: {name_part} (добавил uid={uid})."
+        deep_link = _telegram_chat_deep_link(chat_id)
+        if deep_link:
+            notice += f"\n{deep_link}"
+        _send(team_chat, notice)
 
     if arg:
         if arg in progs:
@@ -522,6 +638,61 @@ def _handle_program_move(chat_id: str, raw_text: str) -> None:
         _send(chat_id, f"Не удалось перенести «{name}» в этот чат.")
 
 
+def _handle_invite_link_regenerate(chat_id: str, uid: str, raw_text: str):
+    """``/hermes_invite_link [chat_id]`` — force a FRESH invite link for a
+    client chat, bypassing the cache. For when the cached one went stale
+    (revoked by a human in Telegram's own UI, chat recreated, etc.) —
+    :func:`_get_invite_link`'s normal path only ever creates one once and
+    reuses it forever, so there's no other way to get a new one short of
+    this.
+
+    Same trust rule as registering a client chat under an existing program
+    (see ``_handle_hermes_program``): live membership in the program's OWN
+    team chat, not necessarily a global admin — any team member who can add
+    a client chat can also refresh its invite link. Two call shapes:
+    - Run INSIDE the client chat itself, no argument -> regenerates for
+      THIS chat.
+    - Run inside the program's own team chat, with the target client chat's
+      id as the argument -> regenerates for THAT chat (must actually be a
+      client chat registered under THIS team's own program — can't reach
+      into another program's client chats this way).
+    """
+    parts = raw_text.split(maxsplit=1)
+    arg = parts[1].strip() if len(parts) > 1 else ""
+
+    if store.chat_mode(chat_id) == "client":
+        target = chat_id
+        program = store.chat_program(chat_id)
+    else:
+        program = store.program_by_team_chat(chat_id)
+        if not program:
+            _send(chat_id, "Эта команда работает в клиентском чате, либо в чате команды "
+                            "программы — с id клиентского чата аргументом: "
+                            "/hermes_invite_link <chat_id>")
+            return _HANDLED
+        if not arg:
+            _send(chat_id, "Укажите id клиентского чата: /hermes_invite_link <chat_id>")
+            return _HANDLED
+        target = arg
+        if store.chat_program(target) != program:
+            _send(chat_id, f"Чат {target} не зарегистрирован как клиентский под «{program}».")
+            return _HANDLED
+
+    team_chat = store.program_chat_id(program) if program else None
+    if not team_chat or not _user_is_member_of_chat(uid, team_chat):
+        return _NON_ADMIN_SILENT
+
+    link = _create_chat_invite_link(target)
+    if not link:
+        _send(chat_id, "Не получилось создать новую ссылку — проверь, что бот состоит в том "
+                        "чате администратором с правом приглашать пользователей.")
+        return _HANDLED
+    store.set_cached_invite_link(target, link)
+    title = store.chat_title(target) or target
+    _send(chat_id, f"🔗 Новая ссылка для «{title}»: {link}")
+    return _HANDLED
+
+
 def _handle_command(event, src, chat_id: str, uid: str, ctype: str = ""):
     """If the message is a /hermes_* chat-admin command, act on it and return a skip
     action (so it isn't forwarded to the agent). Returns None if not a command."""
@@ -544,6 +715,13 @@ def _handle_command(event, src, chat_id: str, uid: str, ctype: str = ""):
             # program-admin status) to their own private chat with the bot.
             return _NON_ADMIN_SILENT
         return _handle_hermes_program(chat_id, uid, title, text)
+
+    if cmd == "/hermes_invite_link":
+        if ctype == "dm":
+            # Same reasoning as /hermes_program — this acts on a client
+            # chat or a program's team chat, neither of which a 1:1 DM is.
+            return _NON_ADMIN_SILENT
+        return _handle_invite_link_regenerate(chat_id, uid, text)
 
     if ctype == "dm" and cmd in ("/hermes_program_rename", "/hermes_program_move"):
         # Same reasoning as /hermes_program above — both act on a program's
