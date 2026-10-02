@@ -59,6 +59,15 @@ def plugin(monkeypatch, tmp_path):
     monkeypatch.setattr(mod, "_send", _fake_send)
     mod._TEST_SENT = sent
 
+    # _escalate_chat also calls _get_invite_link, which — unless a test
+    # overrides it — would otherwise reach the real Telegram Bot API over
+    # the network (createChatInviteLink / getChat) on every call. Default to
+    # "no invite link available" (matches a real bot with no admin rights
+    # and no link in the chat's description) so every pre-existing test in
+    # this file keeps working exactly as before without touching the
+    # network; the dedicated invite-link tests below override this per-test.
+    monkeypatch.setattr(mod, "_get_invite_link", lambda chat_id: None)
+
     yield mod
 
     for key in list(sys.modules):
@@ -179,6 +188,36 @@ def test_escalation_falls_back_to_no_link_for_a_non_supergroup_chat_id(plugin, r
     text = plugin._TEST_SENT[0]["text"]
     assert "t.me" not in text
     assert "Acme Corp" in text
+
+
+def test_escalation_includes_an_invite_link_next_to_the_name_when_available(plugin, monkeypatch, resolved_session):
+    """The join link ("вступить") sits right next to the chat's name — a
+    DIFFERENT link from the message deep-link below it (see _escalate_chat's
+    own comment on why both exist: one works for a non-member, the other
+    only for someone already in the chat)."""
+    _setup_client_chat(plugin, client_chat="-100700")
+    monkeypatch.setattr(plugin.store, "origin_chat_id", lambda session_id: "-100700")
+    monkeypatch.setattr(plugin, "_get_invite_link", lambda chat_id: "https://t.me/+fakeinvite")
+
+    plugin.T.handle_escalate_to_team({"message": "see this"}, session_id="sess-1")
+
+    text = plugin._TEST_SENT[0]["text"]
+    assert "вступить" in text
+    assert "t.me/+fakeinvite" in text
+    assert "Acme Corp" in text
+    # The deep link (own message, below the name) is a SEPARATE link from
+    # the invite one — both present, not one replacing the other.
+    assert "t.me/c/700" in text
+
+
+def test_escalation_omits_the_invite_parenthetical_when_unavailable(plugin, resolved_session):
+    """No invite link obtainable (bot not admin, nothing in the description)
+    -> no "(вступить ...)" at all, rather than a broken/empty link."""
+    _setup_client_chat(plugin)  # fixture's _get_invite_link default is None
+
+    plugin.T.handle_escalate_to_team({"message": "see this"}, session_id=resolved_session)
+
+    assert "вступить" not in plugin._TEST_SENT[0]["text"]
 
 
 def test_delivery_failure_is_reported_and_does_not_burn_the_cooldown(plugin, resolved_session, monkeypatch):

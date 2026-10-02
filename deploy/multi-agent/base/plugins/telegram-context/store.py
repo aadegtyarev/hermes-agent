@@ -194,6 +194,19 @@ def init() -> None:
                 chat_id TEXT PRIMARY KEY, last_reviewed_ts REAL)"""
         )
 
+        # A bot-generated chat invite link, cached so it's created via the Bot
+        # API AT MOST ONCE per chat (createChatInviteLink only ever succeeds
+        # when the bot is an admin there with invite rights — see
+        # _get_invite_link in __init__.py). Deliberately holds ONLY that
+        # case: a link found by scanning the chat's own description (the
+        # fallback for a chat where the bot isn't admin) is NOT cached here —
+        # a human can edit that description at any time, so it's re-read
+        # fresh on every lookup instead of going stale in this table.
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS chat_invite_links(
+                chat_id TEXT PRIMARY KEY, invite_link TEXT, cached_ts REAL)"""
+        )
+
 
 def set_chat(chat_id: str, mode: str, title: str = "", added_by: str = "", program: str | None = None) -> None:
     import time
@@ -216,19 +229,21 @@ def remove_chat(chat_id: str) -> bool:
 
 def forget_chat_state(chat_id: str) -> None:
     """Drop every per-chat table this plugin accumulates for ``chat_id`` —
-    doc-link allowlist, escalation cooldown, batch-review clock. Without
-    this, /hermes_forget only removed the chats_allowed row; re-registering
-    the SAME chat_id later (a new client chat, possibly under a different
-    program) would inherit the PREVIOUS occupant's gdoc allowlist and
-    escalation/review timestamps — a stale doc-id allowlist is the concerning
-    one (a new partner's chat trusting documents an unrelated prior chat
-    once linked)."""
+    doc-link allowlist, escalation cooldown, batch-review clock, cached
+    invite link. Without this, /hermes_forget only removed the chats_allowed
+    row; re-registering the SAME chat_id later (a new client chat, possibly
+    under a different program) would inherit the PREVIOUS occupant's gdoc
+    allowlist and escalation/review timestamps — a stale doc-id allowlist is
+    the concerning one (a new partner's chat trusting documents an unrelated
+    prior chat once linked). A stale cached invite link is also wrong once
+    re-registered (it would point at the OLD occupant's chat)."""
     if not chat_id:
         return
     with _LOCK, _conn() as c:
         c.execute("DELETE FROM chat_doc_links WHERE chat_id=?", (str(chat_id),))
         c.execute("DELETE FROM chat_escalations WHERE chat_id=?", (str(chat_id),))
         c.execute("DELETE FROM chat_review_state WHERE chat_id=?", (str(chat_id),))
+        c.execute("DELETE FROM chat_invite_links WHERE chat_id=?", (str(chat_id),))
 
 
 def chats_by_mode(mode: str) -> set[str]:
@@ -467,6 +482,7 @@ def remove_program_cascade(program: str) -> list[str]:
             c.execute("DELETE FROM chat_doc_links WHERE chat_id=?", (cid,))
             c.execute("DELETE FROM chat_escalations WHERE chat_id=?", (cid,))
             c.execute("DELETE FROM chat_review_state WHERE chat_id=?", (cid,))
+            c.execute("DELETE FROM chat_invite_links WHERE chat_id=?", (cid,))
         return client_ids
 
 
@@ -488,6 +504,30 @@ def chat_doc_ids(chat_id: str) -> set[str]:
     with _conn() as c:
         return {r["doc_id"] for r in c.execute(
             "SELECT doc_id FROM chat_doc_links WHERE chat_id=?", (str(chat_id),)).fetchall()}
+
+
+# ── Cached bot-generated chat invite link (see chat_invite_links' own
+# CREATE TABLE comment in init() for why ONLY this source is cached) ────────
+
+
+def get_cached_invite_link(chat_id: str) -> str | None:
+    if not chat_id:
+        return None
+    with _conn() as c:
+        r = c.execute(
+            "SELECT invite_link FROM chat_invite_links WHERE chat_id=?", (str(chat_id),)
+        ).fetchone()
+        return r["invite_link"] if r else None
+
+
+def set_cached_invite_link(chat_id: str, invite_link: str) -> None:
+    if not chat_id or not invite_link:
+        return
+    with _LOCK, _conn() as c:
+        c.execute(
+            "INSERT OR REPLACE INTO chat_invite_links(chat_id,invite_link,cached_ts) VALUES(?,?,?)",
+            (str(chat_id), invite_link, time.time()),
+        )
 
 
 # ── Resolving which chat a tool call's session belongs to ───────────────────

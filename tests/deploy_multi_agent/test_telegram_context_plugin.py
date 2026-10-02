@@ -514,6 +514,30 @@ def test_telegram_recent_default_chat_id_blocked_from_client_chat(plugin, fake_s
     assert result is not None and result["action"] == "block"
 
 
+def test_telegram_recent_blocked_for_a_different_chat_id_from_client_chat(plugin, fake_session_db):
+    """Mirrors telegram_search's own cross-chat-id guard test — both tools
+    share the same _CLIENT_CHAT_SCOPED_READ_TOOLS code path, but this specific
+    shape (an explicit OTHER chat_id, not just an omitted one) had no
+    dedicated telegram_recent test of its own until now."""
+    _client_session(plugin, fake_session_db, "sess-1", "-700")
+
+    result = plugin._pre_tool_call(
+        tool_name="telegram_recent", args={"chat_id": "-999"}, session_id="sess-1",
+    )
+
+    assert result is not None and result["action"] == "block"
+
+
+def test_telegram_recent_allowed_scoped_to_its_own_chat_id_from_client_chat(plugin, fake_session_db):
+    _client_session(plugin, fake_session_db, "sess-1", "-700")
+
+    result = plugin._pre_tool_call(
+        tool_name="telegram_recent", args={"chat_id": "-700"}, session_id="sess-1",
+    )
+
+    assert result is None
+
+
 def test_session_search_fully_blocked_from_client_chat(plugin, fake_session_db):
     _client_session(plugin, fake_session_db, "sess-1", "-700")
 
