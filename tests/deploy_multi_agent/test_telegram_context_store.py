@@ -242,3 +242,120 @@ def test_create_program_automatically_indexes_the_team_chat_title(store):
     hits = store.search_chat_titles("Integration Team")
 
     assert [h["chat_id"] for h in hits] == ["-100500"]
+
+
+# ── chat_titles backfill: upgrading onto an already-populated DB ───────────
+# chat_titles only gets written going FORWARD (at registration / on ingest).
+# A chat registered before this feature shipped has a title sitting unindexed
+# in chats_allowed/messages.chat_name — these simulate that pre-upgrade state
+# by writing directly via raw SQL (bypassing set_chat()/upsert_chat_title())
+# and resetting the migration gate, then re-running init() exactly like a
+# redeploy would.
+
+def _reset_chat_titles_backfill_gate(store) -> "sqlite3.Connection":
+    import sqlite3
+    conn = sqlite3.connect(store._db_path())
+    conn.execute("DELETE FROM fts_migration_state WHERE key='chat_titles_backfilled'")
+    return conn
+
+
+def test_init_backfills_a_registered_chats_allowed_title(store):
+    conn = _reset_chat_titles_backfill_gate(store)
+    conn.execute(
+        "INSERT INTO chats_allowed(chat_id,mode,title,added_by,added_ts,program) "
+        "VALUES('-100700','client','WB+Innel (интеграция)','111',0,'integration')"
+    )
+    conn.commit()
+    conn.close()
+
+    store.init()
+
+    hits = store.search_chat_titles("Innel")
+    assert [h["chat_id"] for h in hits] == ["-100700"]
+
+
+def test_init_backfills_a_team_chat_title_from_message_history(store):
+    """Team chats have no title anywhere EXCEPT message history —
+    partner_programs never stored one before this feature existed."""
+    conn = _reset_chat_titles_backfill_gate(store)
+    conn.execute(
+        "INSERT INTO messages(chat_id,message_id,ts,user_id,user_name,chat_type,"
+        "chat_name,thread_id,text,reply_to_message_id,reply_to_author) "
+        "VALUES('-100500','1',1.0,'u','n','group','Integration Team','','hi','','')"
+    )
+    conn.commit()
+    conn.close()
+
+    store.init()
+
+    hits = store.search_chat_titles("Integration Team")
+    assert [h["chat_id"] for h in hits] == ["-100500"]
+
+
+def test_init_backfill_prefers_the_most_recent_chat_name(store):
+    conn = _reset_chat_titles_backfill_gate(store)
+    for i, name in enumerate(["Old Group Name", "Renamed Group"]):
+        conn.execute(
+            "INSERT INTO messages(chat_id,message_id,ts,user_id,user_name,chat_type,"
+            "chat_name,thread_id,text,reply_to_message_id,reply_to_author) "
+            "VALUES('-100500',?,?,'u','n','group',?,'','hi','','')",
+            (str(i), float(i), name),
+        )
+    conn.commit()
+    conn.close()
+
+    store.init()
+
+    assert store.search_chat_titles("Old Group Name") == []
+    hits = store.search_chat_titles("Renamed Group")
+    assert hits[0]["chat_id"] == "-100500"
+
+
+def test_init_backfill_registered_title_wins_over_message_history(store):
+    conn = _reset_chat_titles_backfill_gate(store)
+    conn.execute(
+        "INSERT INTO messages(chat_id,message_id,ts,user_id,user_name,chat_type,"
+        "chat_name,thread_id,text,reply_to_message_id,reply_to_author) "
+        "VALUES('-100700','1',1.0,'u','n','group','Stale Name From History','','hi','','')"
+    )
+    conn.execute(
+        "INSERT INTO chats_allowed(chat_id,mode,title,added_by,added_ts,program) "
+        "VALUES('-100700','client','Registered Name','111',0,'integration')"
+    )
+    conn.commit()
+    conn.close()
+
+    store.init()
+
+    assert store.search_chat_titles("Stale Name") == []
+    hits = store.search_chat_titles("Registered Name")
+    assert hits[0]["chat_id"] == "-100700"
+
+
+def test_init_backfill_runs_only_once(store):
+    """The migration gate must actually gate — re-running init() after the
+    one-time backfill already ran must not re-scan chats_allowed/messages
+    (harmless either way here since it's idempotent, but confirms the gate
+    itself works rather than silently always re-running)."""
+    conn = _reset_chat_titles_backfill_gate(store)
+    conn.execute(
+        "INSERT INTO chats_allowed(chat_id,mode,title,added_by,added_ts,program) "
+        "VALUES('-100700','client','First Title','111',0,NULL)"
+    )
+    conn.commit()
+    conn.close()
+    store.init()  # consumes the (reset) gate, backfills "First Title"
+
+    # A title change made directly in chats_allowed AFTER the backfill ran
+    # must NOT retroactively resync — only upsert_chat_title()/a fresh
+    # ingest keeps chat_titles current from here on, same as production.
+    import sqlite3
+    conn = sqlite3.connect(store._db_path())
+    conn.execute("UPDATE chats_allowed SET title='Changed Title' WHERE chat_id='-100700'")
+    conn.commit()
+    conn.close()
+
+    store.init()  # gate is already consumed — must be a no-op for this chat
+
+    assert store.search_chat_titles("First Title") != []
+    assert store.search_chat_titles("Changed Title") == []
