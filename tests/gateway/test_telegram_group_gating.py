@@ -22,6 +22,7 @@ def _make_adapter(
     guest_mode=None,
     observe_unmentioned_group_messages=None,
     read_only_chats=None,
+    always_observe_chats=None,
     bot_username="hermes_bot",
 ):
     from plugins.platforms.telegram.adapter import TelegramAdapter
@@ -65,6 +66,8 @@ def _make_adapter(
         extra["observe_unmentioned_group_messages"] = observe_unmentioned_group_messages
     if read_only_chats is not None:
         extra["read_only_chats"] = read_only_chats
+    if always_observe_chats is not None:
+        extra["always_observe_chats"] = always_observe_chats
 
     adapter = object.__new__(TelegramAdapter)
     adapter.platform = Platform.TELEGRAM
@@ -569,6 +572,64 @@ def test_chats_outside_read_only_list_are_unaffected():
     adapter = _make_adapter(require_mention=False, read_only_chats=["-300"])
 
     assert adapter._should_process_message(_group_message("hello everyone", chat_id=-100)) is True
+
+
+def test_always_observe_chats_captures_unmentioned_messages_without_the_global_toggle():
+    """The whole point: a plugin-managed chat (work/client, registered via an
+    admin command rather than static config) gets its unmentioned messages
+    observed even though observe_unmentioned_group_messages was never turned
+    on globally and group_allowed_chats/allowed_chats were never configured."""
+    async def _run():
+        adapter = _make_adapter(require_mention=True, always_observe_chats=["-400"])
+        store = _FakeSessionStore()
+        adapter._session_store = store
+        update = SimpleNamespace(
+            update_id=3001,
+            message=_group_message("plain chatter, no mention", chat_id=-400),
+            effective_message=None,
+        )
+
+        await adapter._handle_text_message(update, SimpleNamespace())
+
+        adapter._message_handler.assert_not_awaited()
+        assert len(store.messages) == 1
+        assert store.messages[0][1]["observed"] is True
+
+    asyncio.run(_run())
+
+
+def test_always_observe_chats_does_not_block_a_direct_mention_from_dispatching():
+    """Unlike read_only_chats, membership here must NEVER prevent a normal
+    mention/reply/command from triggering a real turn — this mechanism only
+    ADDS observation for messages that don't already trigger one."""
+    text = "hi @hermes_bot"
+    adapter = _make_adapter(require_mention=True, always_observe_chats=["-400"])
+
+    assert adapter._should_process_message(
+        _group_message(text, chat_id=-400, entities=[_mention_entity(text)])
+    ) is True
+
+
+def test_always_observe_chats_does_not_block_commands_either():
+    adapter = _make_adapter(require_mention=True, always_observe_chats=["-400"])
+
+    assert adapter._should_process_message(
+        _group_message("/hermes_program integration", chat_id=-400), is_command=True,
+    ) is False  # no mention/entity on this bare command -> correctly still gated
+    assert adapter._should_process_message(
+        _group_message(
+            "/hermes_program@hermes_bot integration",
+            chat_id=-400,
+            entities=[_bot_command_entity("/hermes_program@hermes_bot integration", "/hermes_program@hermes_bot")],
+        ),
+        is_command=True,
+    ) is True  # directed command dispatches normally, same as any other chat
+
+
+def test_chats_outside_always_observe_list_are_unaffected():
+    adapter = _make_adapter(require_mention=True, always_observe_chats=["-400"])
+
+    assert adapter._should_process_message(_group_message("hello everyone", chat_id=-100)) is False
 
 
 class _FakeSessionEntry:
