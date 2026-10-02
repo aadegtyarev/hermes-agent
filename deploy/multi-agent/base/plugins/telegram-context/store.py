@@ -243,6 +243,50 @@ def init() -> None:
             "INSERT INTO chat_titles_fts(rowid, title) VALUES (new.rowid, new.title); END"
         )
 
+        # One-time backfill: chat_titles only gets written going forward (at
+        # registration time via set_chat()/create_program(), and refreshed on
+        # every ingested message) — a chat registered/observed BEFORE this
+        # table existed has no row here even though its title has been known
+        # all along, sitting unindexed in chats_allowed/messages.chat_name.
+        # Without this, upgrading an already-deployed bot would make
+        # telegram_search silently blind to every chat registered before the
+        # upgrade, until each one happens to get a fresh message — exactly
+        # the "why can't it find the chat we just made" confusion this
+        # feature exists to fix, just shifted to "why can't it find chats
+        # from before the upgrade" instead.
+        already_backfilled = c.execute(
+            "SELECT 1 FROM fts_migration_state WHERE key='chat_titles_backfilled'"
+        ).fetchone()
+        if not already_backfilled:
+            # Message history first (team chats have no title anywhere else —
+            # chats_allowed never carries a program's team chat). Newest
+            # chat_name per chat_id wins: ordered DESC + INSERT OR IGNORE,
+            # so the first row seen for a given chat_id (the most recent
+            # one) is the one that sticks.
+            for row in c.execute(
+                "SELECT chat_id, chat_name FROM messages "
+                "WHERE chat_name IS NOT NULL AND chat_name != '' "
+                "ORDER BY ts DESC"
+            ).fetchall():
+                c.execute(
+                    "INSERT OR IGNORE INTO chat_titles(chat_id,title,updated_ts) VALUES(?,?,?)",
+                    (row["chat_id"], row["chat_name"], time.time()),
+                )
+            # Registered titles win over message history where both exist —
+            # the title captured at /hermes_here//hermes_program time is the
+            # more deliberate, admin-set label.
+            for row in c.execute(
+                "SELECT chat_id, title FROM chats_allowed WHERE title IS NOT NULL AND title != ''"
+            ).fetchall():
+                c.execute(
+                    "INSERT OR REPLACE INTO chat_titles(chat_id,title,updated_ts) VALUES(?,?,?)",
+                    (row["chat_id"], row["title"], time.time()),
+                )
+            c.execute(
+                "INSERT INTO fts_migration_state(key, done_at) VALUES('chat_titles_backfilled', ?)",
+                (time.time(),),
+            )
+
 
 def upsert_chat_title(chat_id: str, title: str) -> None:
     """Record/refresh the known display title for ``chat_id``.
