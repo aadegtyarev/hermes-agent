@@ -46,10 +46,14 @@ several work chats survives leaving just one).
 
 The work/read-only chat allowlist is ENV ∪ a runtime store: a bot operator listed in
 TELEGRAM_ADMIN_USERS can enrol the current chat with a command — no file edits:
-  /hermes_here      → add this chat as work (bot responds)
-  /hermes_readonly  → add this chat as read-only (observe only)
-  /hermes_forget    → drop this chat from the runtime list (or a program's team chat)
-  /hermes_chats     → show the runtime list
+  /hermes_here             → add this chat as work (bot responds)
+  /hermes_readonly         → add this chat as read-only (observe only)
+  /hermes_forget           → drop this chat from the runtime list; inside a program's
+                             team chat with client chats attached, asks for
+                             "/hermes_forget confirm" before cascading the delete to them
+  /hermes_chats            → show the runtime list (with per-program client-chat counts)
+  /hermes_program_rename   → rename a program, from inside its own team chat
+  /hermes_program_move     → re-point a program's team chat to the current (fresh) chat
 Commands are handled in the hook (before gating, so they work in a not-yet-enrolled
 chat), acknowledged via Bot API, and never forwarded to the agent. Commands reach the
 bot even with group privacy mode on (`/cmd@Bot`); full ingest still needs privacy off.
@@ -246,12 +250,22 @@ def _telegram_chat_deep_link(chat_id: str, message_id: str | None = None) -> str
     return f"https://t.me/c/{internal_id}/{message_id or 1}"
 
 
-_CHAT_COMMANDS = {"/hermes_here", "/hermes_readonly", "/hermes_forget", "/hermes_chats", "/hermes_program"}
+_CHAT_COMMANDS = {
+    "/hermes_here", "/hermes_readonly", "/hermes_forget", "/hermes_chats", "/hermes_program",
+    "/hermes_program_rename", "/hermes_program_move",
+}
 # Gated on global TELEGRAM_ADMIN_USERS. /hermes_program is NOT in this set —
 # it has its own contextual auth (see _handle_hermes_program): creating a new
 # program still needs a global admin, but registering a client chat under an
 # EXISTING program only needs live membership in that program's own team chat.
-_GLOBAL_ADMIN_COMMANDS = {"/hermes_here", "/hermes_readonly", "/hermes_forget", "/hermes_chats"}
+# /hermes_program_rename and /hermes_program_move touch the program's trust
+# root (its name / which chat IS the team), so both stay global-admin-only —
+# same bar as creating a program in the first place, unlike registering a
+# client chat under an existing one.
+_GLOBAL_ADMIN_COMMANDS = {
+    "/hermes_here", "/hermes_readonly", "/hermes_forget", "/hermes_chats",
+    "/hermes_program_rename", "/hermes_program_move",
+}
 
 # Menu descriptions for the /hermes_* admin commands. Registering them as plugin
 # slash commands makes them show up in Telegram's "/" menu (private chats — the
@@ -265,12 +279,85 @@ _MENU_COMMANDS = (
     ("hermes_forget", "Убрать этот чат из списка"),
     ("hermes_chats", "Показать список чатов"),
     ("hermes_program", "Создать программу / зарегистрировать клиентский чат"),
+    ("hermes_program_rename", "Переименовать программу (из её чата команды)"),
+    ("hermes_program_move", "Перенести чат команды программы в этот чат"),
 )
 
 
 def _menu_command_fallback(_raw_args: str = "") -> str:
     return ("Команда управляет списком чатов Telegram — её обрабатывает гейтвей "
             "в самом чате; вызывает её оператор бота.")
+
+
+_ADMIN_DM_MENU_DONE: set[str] = set()
+
+
+def _admin_dm_command_list() -> list[dict]:
+    """The command list for an admin's own DM "/" menu: the normal private-chat
+    menu (core + other plugins + skills) plus this plugin's own admin-only
+    ``/hermes_*`` commands appended. Built fresh on every call — the
+    core/skill portion can change across a redeploy, this plugin's own tail
+    is a static constant — so no caching beyond the per-uid "already pushed"
+    guard in :func:`_ensure_admin_dm_menu`.
+    """
+    base: list[tuple[str, str]] = []
+    try:
+        from hermes_cli.commands import telegram_menu_commands
+        base, _hidden = telegram_menu_commands()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("telegram-context: telegram_menu_commands() failed: %s", e)
+    seen = {n for n, _ in base}
+    combined = list(base) + [(n, d) for n, d in _MENU_COMMANDS if n not in seen]
+    return [{"command": n, "description": d[:256]} for n, d in combined]
+
+
+def _ensure_admin_dm_menu(uid: str) -> None:
+    """Push the full "/" menu — standard commands PLUS this plugin's
+    ``/hermes_*`` admin commands — scoped to ONE admin's own private chat.
+
+    The adapter's own startup housekeeping pushes the standard menu via
+    ``BotCommandScopeAllPrivateChats``, which is shared by EVERY DM user —
+    admin or not. This plugin's own ``/hermes_*`` commands are deliberately
+    NOT included in that global registration (see ``register()``'s own
+    comment) because that scope has no concept of "admin only": pushing
+    these there would show the admin command names to a stranger who merely
+    opens a DM with the bot, contradicting the "never reveal the mechanism
+    to a non-admin" rule enforced elsewhere in this module (``_NON_ADMIN_
+    SILENT``). ``BotCommandScopeChat(chat_id=uid)`` is the fix — Telegram
+    gives a private chat the SAME id as the user's own user_id, and a
+    chat-scoped command list takes priority over (replaces, doesn't merge
+    with) the all-private-chats one for that one chat only, so the combined
+    list built above must include the standard commands too, not just the
+    admin-only tail.
+
+    Requires the bot to already have *some* chat with this uid from
+    Telegram's side (i.e. the admin has opened a DM with the bot at least
+    once) — calling this before that happens fails harmlessly (logged,
+    uid stays out of the "done" set, retried the next time this fires).
+    Idempotent per uid for this process's lifetime: Telegram persists the
+    scope server-side across reconnects, so there's nothing to redo once a
+    push has actually succeeded.
+    """
+    if not uid or uid in _ADMIN_DM_MENU_DONE:
+        return
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    if not token:
+        return
+    try:
+        payload = urllib.parse.urlencode({
+            "commands": json.dumps(_admin_dm_command_list()),
+            "scope": json.dumps({"type": "chat", "chat_id": uid}),
+        }).encode()
+        with urllib.request.urlopen(
+                f"https://api.telegram.org/bot{token}/setMyCommands", data=payload, timeout=8) as r:
+            result = json.loads(r.read().decode())
+        if result.get("ok"):
+            _ADMIN_DM_MENU_DONE.add(uid)
+        else:
+            logger.warning("telegram-context: admin DM menu setMyCommands rejected for uid=%s: %s",
+                            uid, result.get("description"))
+    except Exception as e:  # noqa: BLE001
+        logger.warning("telegram-context: admin DM menu setMyCommands failed for uid=%s: %s", uid, e)
 
 
 _last_group_menu_clear = 0.0
@@ -385,6 +472,56 @@ def _handle_hermes_program(chat_id: str, uid: str, title: str, raw_text: str):
     return _HANDLED
 
 
+def _handle_program_rename(chat_id: str, raw_text: str) -> None:
+    """``/hermes_program_rename <new-name>`` — run inside the program's OWN
+    team chat (admin-gated at the call site). A rename carries every client
+    chat registered under the program along automatically (they reference a
+    program by name, not by its team chat_id — see store.rename_program)."""
+    old_name = store.program_by_team_chat(chat_id)
+    if not old_name:
+        _send(chat_id, "Эта команда работает только внутри чата команды программы.")
+        return
+    parts = raw_text.split(maxsplit=1)
+    new_name = parts[1].strip().lower() if len(parts) > 1 else ""
+    if not new_name:
+        _send(chat_id, "Укажите новое имя: /hermes_program_rename <new-name>")
+        return
+    if store.rename_program(old_name, new_name):
+        _send(chat_id, f"✏️ Программа «{old_name}» переименована в «{new_name}».")
+    else:
+        _send(chat_id, f"Не удалось переименовать «{old_name}»: имя «{new_name}» уже занято "
+                        "или некорректно (строчные латинские буквы/цифры/-/_).")
+
+
+def _handle_program_move(chat_id: str, raw_text: str) -> None:
+    """``/hermes_program_move <name>`` — run inside a FRESH (not-yet-registered)
+    chat (admin-gated at the call site). Re-points an EXISTING program's team
+    chat to the current chat. Client chats are unaffected — same reason as
+    rename, they never reference the program by chat_id (see
+    store.move_program_chat)."""
+    if (store.chat_mode(chat_id) or store.is_program_team_chat(chat_id)
+            or chat_id in _work_chats() or chat_id in _readonly_chats()):
+        _send(chat_id, "Этот чат уже зарегистрирован — для переноса программы сюда нужен "
+                        "свежий, ещё не зарегистрированный чат.")
+        return
+    parts = raw_text.split(maxsplit=1)
+    name = parts[1].strip().lower() if len(parts) > 1 else ""
+    if not name:
+        _send(chat_id, "Укажите имя программы: /hermes_program_move <name>")
+        return
+    old_team_chat = store.program_chat_id(name)
+    if not old_team_chat:
+        _send(chat_id, f"Программа «{name}» не найдена.")
+        return
+    if store.move_program_chat(name, chat_id):
+        _send(chat_id, f"➡️ Программа «{name}» перенесена сюда — этот чат теперь её команда.")
+        if old_team_chat != chat_id:
+            _send(old_team_chat, f"⚠️ Программа «{name}» перенесена в другой чат — этот чат "
+                                  "больше не является её чатом команды.")
+    else:
+        _send(chat_id, f"Не удалось перенести «{name}» в этот чат.")
+
+
 def _handle_command(event, src, chat_id: str, uid: str, ctype: str = ""):
     """If the message is a /hermes_* chat-admin command, act on it and return a skip
     action (so it isn't forwarded to the agent). Returns None if not a command."""
@@ -408,6 +545,11 @@ def _handle_command(event, src, chat_id: str, uid: str, ctype: str = ""):
             return _NON_ADMIN_SILENT
         return _handle_hermes_program(chat_id, uid, title, text)
 
+    if ctype == "dm" and cmd in ("/hermes_program_rename", "/hermes_program_move"):
+        # Same reasoning as /hermes_program above — both act on a program's
+        # team-chat binding, which is meaningless for a 1:1 DM.
+        return _NON_ADMIN_SILENT
+
     if uid not in _admin_users():
         # Silent ignore, no "⛔ not allowed" reply — a non-admin poking
         # /hermes_* shouldn't get any acknowledgement that the command
@@ -419,16 +561,46 @@ def _handle_command(event, src, chat_id: str, uid: str, ctype: str = ""):
     elif cmd == "/hermes_readonly":
         store.set_chat(chat_id, "readonly", title, uid)
         _send(chat_id, "👀 Чат добавлен как read-only — читаю для контекста, не отвечаю.")
+    elif cmd == "/hermes_program_rename":
+        _handle_program_rename(chat_id, text)
+    elif cmd == "/hermes_program_move":
+        _handle_program_move(chat_id, text)
     elif cmd == "/hermes_forget":
-        removed_program = store.remove_program_by_chat(chat_id)
-        removed_chat = store.remove_chat(chat_id)
-        store.forget_chat_state(chat_id)
-        if removed_program:
-            _send(chat_id, f"🗑 Программа «{removed_program}» удалена (чат команды освобождён).")
-        elif removed_chat:
-            _send(chat_id, "🗑 Чат убран из списка.")
+        program = store.program_by_team_chat(chat_id)
+        if program:
+            # A team chat's /hermes_forget is a cascade-risk: the program may
+            # have client chats registered under it, which remove_program_by_
+            # chat alone would orphan silently (their chats_allowed.program
+            # row would name a program that no longer exists). Require an
+            # explicit "confirm" before actually deleting them, same
+            # trust-weight as creating/renaming/moving a program — no
+            # friction added when there's nothing to lose (no client chats
+            # yet), matching the command's pre-existing one-step behavior.
+            clients = store.program_client_chats(program)
+            parts = text.split(maxsplit=1)
+            confirmed = len(parts) > 1 and parts[1].strip().lower() == "confirm"
+            if clients and not confirmed:
+                _send(chat_id,
+                      f"⚠️ У программы «{program}» зарегистрировано клиентских чатов: "
+                      f"{len(clients)}. Чтобы удалить программу ВМЕСТЕ с ними, напишите: "
+                      "/hermes_forget confirm\nЕсли нужно просто сменить чат команды — "
+                      "используйте /hermes_program_move из нового чата, клиентские чаты "
+                      "это не затронет.")
+                return _HANDLED
+            removed_clients = store.remove_program_cascade(program)
+            store.forget_chat_state(chat_id)
+            if removed_clients:
+                _send(chat_id, f"🗑 Программа «{program}» удалена вместе с "
+                                f"{len(removed_clients)} клиентским(и) чатом(ами).")
+            else:
+                _send(chat_id, f"🗑 Программа «{program}» удалена (чат команды освобождён).")
         else:
-            _send(chat_id, "Этого чата нет в динамическом списке (возможно, он задан через .env).")
+            removed_chat = store.remove_chat(chat_id)
+            store.forget_chat_state(chat_id)
+            if removed_chat:
+                _send(chat_id, "🗑 Чат убран из списка.")
+            else:
+                _send(chat_id, "Этого чата нет в динамическом списке (возможно, он задан через .env).")
     elif cmd == "/hermes_chats":
         rows = store.list_chats()
         progs = store.programs()
@@ -436,7 +608,11 @@ def _handle_command(event, src, chat_id: str, uid: str, ctype: str = ""):
                  + (f" [{r['program']}]" if r.get("program") else "")
                  + (f" — {r['title']}" if r.get("title") else "")
                  for r in rows]
-        lines += [f"• program «{name}»: team chat {chat}" for name, chat in progs.items()]
+        lines += [
+            f"• program «{name}»: team chat {chat} "
+            f"({len(store.program_client_chats(name))} клиентских чатов)"
+            for name, chat in progs.items()
+        ]
         if lines:
             _send(chat_id, "Динамический список:\n" + "\n".join(lines))
         else:
@@ -771,6 +947,8 @@ def _on_dispatch(event=None, gateway=None, session_store=None, **kwargs):
 
         if ctype == "dm":
             _ingest(event)
+            if uid in _admin_users():
+                _ensure_admin_dm_menu(uid)
             if _dm_allowed(uid):
                 _auto_approve_pairing(uid, getattr(src, "user_name", "") or "")
                 return None
@@ -983,6 +1161,14 @@ def register(ctx) -> None:
     # Surface the /hermes_* admin commands in Telegram's "/" menu. Handling stays
     # in the hook above (fires before auth); these registrations are for menu
     # visibility + gateway command recognition. Non-fatal if unsupported.
+    #
+    # NOTE: the adapter pushes whatever this registers into
+    # BotCommandScopeAllPrivateChats (shared by every DM user) alongside
+    # BotCommandScopeAllGroupChats (blanked separately by
+    # _clear_group_command_menu, see its own docstring) — there is no "admin
+    # only" scope at this registration layer. _ensure_admin_dm_menu below is
+    # the actual admin-only surfacing: it additionally pushes the full menu
+    # via BotCommandScopeChat to each admin's own DM specifically.
     register_command = getattr(ctx, "register_command", None)
     if callable(register_command):
         for _name, _desc in _MENU_COMMANDS:
@@ -990,3 +1176,9 @@ def register(ctx) -> None:
                 register_command(name=_name, handler=_menu_command_fallback, description=_desc)
             except Exception as e:  # noqa: BLE001
                 logger.warning("telegram-context register_command %s failed: %s", _name, e)
+    # Best-effort: push the admin-scoped DM menu right away for every admin
+    # who has already opened a DM with the bot before this load (the DM
+    # branch of _on_dispatch handles anyone who opens/messages one later).
+    # Harmless no-op per uid if Telegram has no chat with them yet.
+    for _uid in _admin_users():
+        _ensure_admin_dm_menu(_uid)
