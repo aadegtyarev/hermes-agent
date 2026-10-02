@@ -806,6 +806,33 @@ def cleanup_image_cache(max_age_hours: int = 24) -> int:
     return removed
 
 
+def cleanup_video_cache(max_age_hours: int = 24) -> int:
+    """
+    Delete cached videos older than *max_age_hours*.
+
+    Same pattern as cleanup_image_cache/cleanup_document_cache — video was
+    the one cache dir with no periodic cleanup at all (confirmed: unlike
+    image/document, nothing called a video equivalent anywhere), so an
+    observed group chat with any video traffic grew get_video_cache_dir()
+    without bound. See gateway/run.py's housekeeping loop for the caller.
+
+    Returns the number of files removed.
+    """
+    import time
+
+    cache_dir = get_video_cache_dir()
+    cutoff = time.time() - (max_age_hours * 3600)
+    removed = 0
+    for f in cache_dir.iterdir():
+        if f.is_file() and f.stat().st_mtime < cutoff:
+            try:
+                f.unlink()
+                removed += 1
+            except OSError:
+                pass
+    return removed
+
+
 # ---------------------------------------------------------------------------
 # Audio cache utilities
 #

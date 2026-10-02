@@ -195,6 +195,74 @@ def _sync_always_observe_chats_env() -> None:
         logger.warning("telegram-context: failed to sync always-observe chats env: %s", e)
 
 
+def _auto_describe_images_enabled() -> bool:
+    """Toggle for synchronous image auto-description in _ingest() (default on).
+
+    TELEGRAM_AUTO_DESCRIBE_IMAGES=0/false/no/off disables it entirely — the
+    image still gets cached and noted with its path exactly as before, just
+    without a vision call.
+    """
+    return os.environ.get("TELEGRAM_AUTO_DESCRIBE_IMAGES", "1").strip().lower() not in {
+        "0", "false", "no", "off",
+    }
+
+
+def _active_dialogue_window_seconds() -> float:
+    """How recent a chat's last message must be to count as "active" for the
+    purposes of synchronous image description (see _ingest())."""
+    try:
+        return max(0.0, float(os.environ.get("TELEGRAM_ACTIVE_DIALOGUE_WINDOW_SECONDS", "600")))
+    except (TypeError, ValueError):
+        return 600.0
+
+
+def _describe_image_sync(image_path: str) -> str | None:
+    """Ask the configured vision model to describe one already-cached image,
+    inline and blocking.
+
+    Reuses the same sync helpers/LLM-call path as tools/vision_tools.py's
+    async vision_analyze_tool (agent.auxiliary_client.call_llm resolves the
+    configured auxiliary.vision provider/model) but the sync sibling
+    (call_llm, not async_call_llm) since this runs from pre_gateway_dispatch,
+    which has no async path at all — same constraint _user_is_member_of_chat
+    already lives with for its own blocking getChatMember call a few
+    functions up. Bounded by a short timeout so one slow vision call can't
+    stall the gateway's single event loop for long; on any failure this just
+    returns None and the caller falls back to the plain cached-path note.
+    """
+    try:
+        from pathlib import Path as _Path
+
+        from agent.auxiliary_client import call_llm, extract_content_or_reasoning
+        from tools.vision_tools import _determine_mime_type, _image_to_base64_data_url
+
+        path = _Path(image_path)
+        if not path.is_file():
+            return None
+        mime = _determine_mime_type(path)
+        data_url = _image_to_base64_data_url(path, mime_type=mime)
+        messages = [{
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        "Describe this image concisely (2-4 sentences): what it shows, "
+                        "any visible text/numbers/labels, and anything that looks "
+                        "actionable or important."
+                    ),
+                },
+                {"type": "image_url", "image_url": {"url": data_url}},
+            ],
+        }]
+        response = call_llm(task="vision", messages=messages, temperature=0.1, max_tokens=400, timeout=20.0)
+        text = extract_content_or_reasoning(response).strip()
+        return text or None
+    except Exception as e:  # noqa: BLE001
+        logger.warning("telegram-context: image auto-describe failed for %s: %s", image_path, e)
+        return None
+
+
 def _admin_users() -> set[str]:
     return _csv("TELEGRAM_ADMIN_USERS")
 
@@ -961,6 +1029,40 @@ def _ingest(event) -> None:
     uid = str(getattr(src, "user_id", "") or "")
     text = getattr(event, "text", "") or ""
     chat_name = getattr(src, "chat_name", "") or ""
+
+    # Synchronous image auto-description. Scope (2026-10-02): describe
+    # immediately only for a REAL dispatch (uid set — mention/reply/command/
+    # DM: the empty-vs-non-empty uid signal _apply_telegram_group_observe_
+    # attribution already gives every event, no new plumbing needed) OR a
+    # chat that's already an "active dialogue" (another message landed in
+    # the last _active_dialogue_window_seconds()). Everything else (a photo
+    # dropped into a chat that's been quiet) is left exactly as before — just
+    # the bare "[image '...' saved at: <path>]" cache-path note from
+    # cache_media_bytes()/CachedMedia.context_note(), recoverable on demand
+    # while the 24h cache window lasts. This is the cheap, reproducible
+    # definition the user settled on in place of a half-remembered, never-
+    # located "гибкий механизм внимания" — not that mechanism; see the
+    # client_chat_batch_review.py escalation path for the actual existing
+    # silence-then-partner-message-notifies-the-team feature, which is
+    # unrelated to this one.
+    if _auto_describe_images_enabled():
+        media_urls = list(getattr(event, "media_urls", None) or [])
+        media_types = list(getattr(event, "media_types", None) or [])
+        image_items = [
+            (u, t) for u, t in zip(media_urls, media_types)
+            if (t or "").lower().startswith("image/")
+        ]
+        if image_items:
+            is_active = bool(uid) or store.chat_has_recent_activity(
+                chat_id, _active_dialogue_window_seconds())
+            if is_active:
+                for image_path, _mime in image_items:
+                    description = _describe_image_sync(image_path)
+                    if description:
+                        note = f"[image description: {description}]"
+                        text = f"{text}\n{note}" if text else note
+                event.text = text
+
     store.add({
         "chat_id": chat_id,
         "message_id": str(getattr(event, "message_id", "") or ""),

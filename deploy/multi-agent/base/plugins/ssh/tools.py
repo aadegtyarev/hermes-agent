@@ -408,7 +408,7 @@ def handle_ssh_keygen(args, **kw):
     if os.path.exists(path) and not args.get("overwrite"):
         pub = path + ".pub"
         if os.path.exists(pub):
-            return tool_result({"path": path, "existed": True, "public_key": open(pub).read().strip()})
+            return tool_result({"path": path, "existed": True, "public_key": open(pub, encoding="utf-8").read().strip()})
     try:
         subprocess.run(["ssh-keygen", "-t", "ed25519", "-f", path, "-N", "", "-C", comment],
                        capture_output=True, text=True, timeout=30, check=True,
@@ -417,7 +417,7 @@ def handle_ssh_keygen(args, **kw):
         return tool_error(f"ssh-keygen failed: {(e.stderr or e.stdout or '')[:300]}")
     except FileNotFoundError:
         return tool_error("ssh-keygen not found")
-    return tool_result({"path": path, "public_key": open(path + ".pub").read().strip()})
+    return tool_result({"path": path, "public_key": open(path + ".pub", encoding="utf-8").read().strip()})
 
 
 def handle_ssh_copy_id(args, **kw):
@@ -430,7 +430,7 @@ def handle_ssh_copy_id(args, **kw):
     pub = key_path + ".pub"
     if not os.path.exists(pub):
         return tool_error(f"public key not found: {pub} (run ssh_keygen first)")
-    pubkey = open(pub).read().strip()
+    pubkey = open(pub, encoding="utf-8").read().strip()
     remote = (f'umask 077; mkdir -p ~/.ssh && '
               f'grep -qxF {shlex.quote(pubkey)} ~/.ssh/authorized_keys 2>/dev/null || '
               f'echo {shlex.quote(pubkey)} >> ~/.ssh/authorized_keys')

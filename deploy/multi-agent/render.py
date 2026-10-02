@@ -260,6 +260,8 @@ def seed_instance(agent: dict, base_cfg: dict, enabled_plugins: List[str]) -> Pa
             "TELEGRAM_WORK_CHATS=        # OPTIONAL seed: chat ids where the bot RESPONDS (also add live via /hermes_here)",
             "TELEGRAM_READONLY_CHATS=    # OPTIONAL seed: read-only chat ids (also add live via /hermes_readonly)",
             "TELEGRAM_DM_EXTRA_USERS=    # extra user ids always allowed to DM (beyond auto-collected)",
+            "TELEGRAM_AUTO_DESCRIBE_IMAGES=        # default on; set 0/false to disable synchronous image vision description on ingest",
+            "TELEGRAM_ACTIVE_DIALOGUE_WINDOW_SECONDS=  # default 600; how recent a chat's last message must be to count as an active dialogue for image auto-description",
         ]
     if "bitwarden" in plugset:
         lines += [
