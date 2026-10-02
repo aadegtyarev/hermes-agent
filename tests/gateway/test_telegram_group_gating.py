@@ -194,6 +194,80 @@ def test_unmentioned_group_messages_can_be_observed_without_dispatching():
     asyncio.run(_run())
 
 
+def test_observed_group_message_still_fires_pre_gateway_dispatch_hook(monkeypatch):
+    """An observed (unmentioned, not-dispatched) group message must still
+    reach plugins' pre_gateway_dispatch hooks — their own ingestion-side
+    effects (e.g. telegram-context storing every message in a chat it
+    manages) have no other way to see a message that never triggers a real
+    turn. The normal gateway/run.py dispatch path never runs for this
+    message (_should_process_message already returned False), so this hook
+    firing can only come from _observe_unmentioned_group_message itself."""
+    async def _run():
+        calls = []
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda name, **kw: calls.append((name, kw)) or [],
+        )
+        adapter = _make_adapter(
+            require_mention=True,
+            allowed_chats=["-100"],
+            group_allowed_chats=["-100"],
+            observe_unmentioned_group_messages=True,
+        )
+        store = _FakeSessionStore()
+        adapter._session_store = store
+        update = SimpleNamespace(
+            update_id=1001,
+            message=_group_message("side chatter"),
+            effective_message=None,
+        )
+
+        await adapter._handle_text_message(update, SimpleNamespace())
+
+        assert len(calls) == 1
+        hook_name, kwargs = calls[0]
+        assert hook_name == "pre_gateway_dispatch"
+        assert kwargs["event"].text == "side chatter"
+        assert kwargs["session_store"] is store
+        # No live GatewayRunner at this call site (the adapter has no
+        # reference to one) — plugins must tolerate gateway=None, same as
+        # telegram-context's own _on_dispatch(gateway=None, ...) default.
+        assert kwargs["gateway"] is None
+
+    asyncio.run(_run())
+
+
+def test_a_failing_pre_gateway_dispatch_hook_does_not_break_observation(monkeypatch):
+    """The hook call is a pure side channel for plugins — a plugin raising
+    must not prevent the core's own observe-transcript append (which runs
+    first) from having already succeeded, and must not propagate out of
+    _handle_text_message."""
+    async def _run():
+        def _boom(name, **kw):
+            raise RuntimeError("plugin exploded")
+
+        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _boom)
+        adapter = _make_adapter(
+            require_mention=True,
+            allowed_chats=["-100"],
+            group_allowed_chats=["-100"],
+            observe_unmentioned_group_messages=True,
+        )
+        store = _FakeSessionStore()
+        adapter._session_store = store
+        update = SimpleNamespace(
+            update_id=1001,
+            message=_group_message("side chatter"),
+            effective_message=None,
+        )
+
+        await adapter._handle_text_message(update, SimpleNamespace())  # must not raise
+
+        assert len(store.messages) == 1  # core observe-transcript append still happened
+
+    asyncio.run(_run())
+
+
 def test_clean_bot_trigger_text_keeps_directed_command_separate_from_arg():
     # A directed slash command "/cmd@botname arg" must not collapse into
     # "/cmdarg": Telegram attaches "@botname" straight to the command token,
