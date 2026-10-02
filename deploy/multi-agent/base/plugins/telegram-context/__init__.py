@@ -1438,6 +1438,14 @@ def register(ctx) -> None:
         store.init()
     except Exception as e:  # noqa: BLE001
         logger.warning("telegram-context store init failed: %s", e)
+    # Sync at load time too, not just reactively inside _on_dispatch: on a
+    # fresh gateway process, TELEGRAM_ALWAYS_OBSERVE_CHATS starts unset until
+    # SOME dispatch-eligible event runs the sync — meaning the very first
+    # plain (unmentioned) message in an already-registered chat, right after
+    # a restart, would read an empty env var and get dropped before anything
+    # ever populated it for next time. Populating it here, from whatever is
+    # already in the store, closes that window completely.
+    _sync_always_observe_chats_env()
     _ensure_backup_cron_job()
     _ensure_batch_review_cron_job()
     for name, schema, handler, emoji in T.TOOLS:
