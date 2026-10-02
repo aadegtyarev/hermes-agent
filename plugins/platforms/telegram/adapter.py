@@ -7390,7 +7390,27 @@ class TelegramAdapter(BasePlatformAdapter):
         update_id: Optional[int] = None,
         event: Optional[MessageEvent] = None,
     ) -> None:
-        """Append skipped group chatter to the target session without dispatching."""
+        """Append skipped group chatter to the target session without dispatching.
+
+        Also fires the pre_gateway_dispatch plugin hook, for its INGESTION side
+        effects only — the hook's returned action (skip/rewrite/allow) is
+        deliberately ignored here, since this call site already decided not to
+        dispatch a real turn; there is no dispatch decision left for a plugin
+        to influence. Without this, a plugin that wants to store every message
+        in a chat it manages (not just ones that happen to mention the bot or
+        reply to it — e.g. an isolated client/partner chat, or any group added
+        via a dynamic admin command rather than the static allowed_chats/
+        free_response_chats config) never gets a chance to see this message at
+        all: the normal pre_gateway_dispatch call only ever fires from the
+        dispatch path in gateway/run.py, which a message that reaches THIS
+        function never reaches (_should_process_message() already returned
+        False, so the event-building/dispatch pipeline was skipped entirely
+        before this function was even called). Kept in its own try/except,
+        after the existing observe-transcript logic, so a misbehaving plugin
+        hook can never prevent the core's own observe-transcript append below
+        from completing, and a transcript-append failure doesn't block the
+        hook from at least being attempted with whatever event was built.
+        """
         store = getattr(self, "_session_store", None)
         if not store:
             return
@@ -7417,6 +7437,16 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception as exc:
             adapter_name = getattr(self, "name", "telegram")
             logger.warning("[%s] Failed to observe Telegram group message: %s", adapter_name, exc)
+            return
+
+        try:
+            from hermes_cli.plugins import invoke_hook as _invoke_hook
+            _invoke_hook("pre_gateway_dispatch", event=event, gateway=None, session_store=store)
+        except Exception as exc:
+            adapter_name = getattr(self, "name", "telegram")
+            logger.warning(
+                "[%s] pre_gateway_dispatch hook failed for an observed message: %s", adapter_name, exc,
+            )
 
     def _is_own_message(self, message: Message) -> bool:
         """Return True when the message was sent by this bot itself.
