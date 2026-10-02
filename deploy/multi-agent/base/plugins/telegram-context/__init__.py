@@ -140,6 +140,34 @@ def _client_chats() -> set[str]:
     return _store_chats("client")
 
 
+def _sync_always_observe_chats_env() -> None:
+    """Mirror this plugin's own chat registry into the core adapter's
+    TELEGRAM_ALWAYS_OBSERVE_CHATS env var, so an unmentioned message in one
+    of these chats still reaches _observe_unmentioned_group_message (and,
+    from there, this plugin's own pre_gateway_dispatch hook) instead of
+    being silently dropped before any event is even built — see
+    plugins/platforms/telegram/adapter.py's _telegram_always_observe_chats
+    docstring for the full story and why this is NOT the same mechanism as
+    read_only_chats (that one also gates _should_process_message; this one
+    deliberately does not, so normal mention/reply/command dispatch in
+    these chats is completely unaffected).
+
+    Covers every chat mode this plugin manages — work/client/readonly
+    (dynamic registrations AND the static TELEGRAM_*_CHATS env lists alike)
+    plus every program's own team chat (which lives only in
+    partner_programs, never chats_allowed). Recomputed fresh on every
+    dispatch call (see _on_dispatch) rather than only at mutation time —
+    cheap (a handful of small set reads + one os.environ write) and
+    guarantees this can never drift out of sync with the store, regardless
+    of which of several admin-command code paths last changed it.
+    """
+    try:
+        chats = _work_chats() | _client_chats() | _readonly_chats() | set(store.programs().values())
+        os.environ["TELEGRAM_ALWAYS_OBSERVE_CHATS"] = ",".join(sorted(chats))
+    except Exception as e:  # noqa: BLE001
+        logger.warning("telegram-context: failed to sync always-observe chats env: %s", e)
+
+
 def _admin_users() -> set[str]:
     return _csv("TELEGRAM_ADMIN_USERS")
 
@@ -1184,6 +1212,7 @@ def _on_dispatch(event=None, gateway=None, session_store=None, **kwargs):
         if src is None or "telegram" not in str(getattr(src, "platform", "")).lower():
             return None
         _clear_group_command_menu()  # keep the group "/" menu blank (throttled)
+        _sync_always_observe_chats_env()
         chat_id = str(getattr(src, "chat_id", "") or "")
         ctype = (getattr(src, "chat_type", "") or "").lower()
         uid = str(getattr(src, "user_id", "") or "")
@@ -1192,6 +1221,15 @@ def _on_dispatch(event=None, gateway=None, session_store=None, **kwargs):
         # chat that isn't enrolled yet (otherwise the gate would skip them first).
         cmd_result = _handle_command(event, src, chat_id, uid, ctype)
         if cmd_result is not None:
+            # A command just ran and may have mutated the chat registry
+            # (/hermes_here, /hermes_program, /hermes_readonly, /hermes_forget,
+            # ...) — resync immediately rather than waiting for some OTHER
+            # chat's next message to opportunistically trigger it. Without
+            # this, the very first plain message sent right after
+            # registering a brand-new chat could still race the env var
+            # (the sync at the top of this function reflects the registry
+            # as it was BEFORE this command's own mutation).
+            _sync_always_observe_chats_env()
             return cmd_result
 
         work, ro, client = _work_chats(), _readonly_chats(), _client_chats()

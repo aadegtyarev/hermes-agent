@@ -6776,6 +6776,30 @@ class TelegramAdapter(BasePlatformAdapter):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
 
+    def _telegram_always_observe_chats(self) -> set[str]:
+        """Chats whose unmentioned group messages must always be observed
+        (stored via _observe_unmentioned_group_message, which also fires
+        plugins' own pre_gateway_dispatch hooks), regardless of the
+        observe_unmentioned_group_messages toggle or observe_allowed_chats
+        restriction.
+
+        Unlike read_only_chats, membership here is ONLY ever consulted from
+        _should_observe_unmentioned_group_message — it is deliberately NOT
+        also checked in _should_process_message, so it can never block a
+        normal mention/reply/command from dispatching and triggering a real
+        turn in one of these chats; it only adds storage for the messages
+        that don't trigger one. Intended for a plugin that manages its own
+        chat registry dynamically (added via an admin command, not a static
+        config.yaml edit) to bridge that registry in here at runtime via
+        the env var, since config.extra is fixed at adapter construction.
+        """
+        raw = self.config.extra.get("always_observe_chats")
+        if raw is None:
+            raw = os.getenv("TELEGRAM_ALWAYS_OBSERVE_CHATS", "")
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        return {part.strip() for part in str(raw).split(",") if part.strip()}
+
     def _telegram_allowed_chats(self) -> set[str]:
         """Return the whitelist of group/supergroup chat IDs the bot will respond in.
 
@@ -7126,6 +7150,22 @@ class TelegramAdapter(BasePlatformAdapter):
         # those are hard-blocked from ever triggering a real response (see
         # _should_process_message() and the read-only guard in send()).
         if chat_id_str in self._telegram_read_only_chats():
+            return True
+
+        # always_observe_chats: same idea as read_only_chats' carve-out above
+        # (always considered observed, regardless of the
+        # observe_unmentioned_group_messages toggle or observe_allowed_chats
+        # restriction below) but DELIBERATELY NOT also wired into
+        # _should_process_message — unlike read_only_chats, membership here
+        # must never block a normal mention/reply/command from dispatching
+        # and triggering a real turn, only ADD storage for the messages that
+        # don't. This is the generic knob a plugin that dynamically manages
+        # its own chat registry (added via an admin command, not static
+        # config.yaml) bridges into via TELEGRAM_ALWAYS_OBSERVE_CHATS, so an
+        # unmentioned message in such a chat still reaches
+        # _observe_unmentioned_group_message (and, from there, plugins' own
+        # pre_gateway_dispatch hooks) instead of being silently dropped.
+        if chat_id_str in self._telegram_always_observe_chats():
             return True
 
         if not self._telegram_observe_unmentioned_group_messages():

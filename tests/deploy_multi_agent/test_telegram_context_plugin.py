@@ -869,3 +869,56 @@ def test_allowlist_does_not_apply_to_work_or_readonly_chats(plugin, fake_session
 
     for tool_name in ("terminal", "cronjob", "delegate_task", "telegram_thread", "gsheet_read"):
         assert plugin._pre_tool_call(tool_name=tool_name, args={}, session_id="sess-2") is None
+
+
+# ── _sync_always_observe_chats_env: bridges our dynamic registry into the
+# core adapter's TELEGRAM_ALWAYS_OBSERVE_CHATS env var, so an unmentioned
+# message in a plugin-registered chat still gets observed (see
+# plugins/platforms/telegram/adapter.py's _telegram_always_observe_chats). ──
+
+def test_sync_always_observe_chats_env_includes_every_chat_mode(plugin, monkeypatch):
+    monkeypatch.delenv("TELEGRAM_ALWAYS_OBSERVE_CHATS", raising=False)
+    monkeypatch.delenv("TELEGRAM_WORK_CHATS", raising=False)
+    plugin.store.set_chat("-800", "work", "", "111")
+    plugin.store.set_chat("-900", "readonly", "", "111")
+    plugin.store.create_program("integration", "-500", "111")
+    plugin.store.set_chat("-700", "client", "WB+Innel", "222", program="integration")
+
+    plugin._sync_always_observe_chats_env()
+
+    synced = set(plugin.os.environ.get("TELEGRAM_ALWAYS_OBSERVE_CHATS", "").split(","))
+    assert synced == {"-800", "-900", "-500", "-700"}
+
+
+def test_sync_always_observe_chats_env_includes_static_work_chats_env_too(plugin, monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WORK_CHATS", "-999")
+    monkeypatch.delenv("TELEGRAM_ALWAYS_OBSERVE_CHATS", raising=False)
+
+    plugin._sync_always_observe_chats_env()
+
+    assert "-999" in plugin.os.environ.get("TELEGRAM_ALWAYS_OBSERVE_CHATS", "").split(",")
+
+
+def test_sync_always_observe_chats_env_empty_registry_clears_the_var(plugin, monkeypatch):
+    monkeypatch.delenv("TELEGRAM_WORK_CHATS", raising=False)
+    monkeypatch.setenv("TELEGRAM_ALWAYS_OBSERVE_CHATS", "-stale-leftover")
+
+    plugin._sync_always_observe_chats_env()
+
+    assert plugin.os.environ.get("TELEGRAM_ALWAYS_OBSERVE_CHATS", "") == ""
+
+
+def test_dispatch_resyncs_the_env_var_after_a_registering_command(plugin, monkeypatch):
+    """The actual race this closes: the sync at the top of _on_dispatch
+    reflects the registry as it was BEFORE the current message's own command
+    mutates it — without a second sync right after handling the command, the
+    very first plain message sent in a just-registered chat could still miss
+    the env var update."""
+    monkeypatch.setenv("TELEGRAM_ADMIN_USERS", "111")
+    monkeypatch.delenv("TELEGRAM_ALWAYS_OBSERVE_CHATS", raising=False)
+    monkeypatch.setattr(plugin, "_send", lambda chat_id, text: None)
+    msg = _group_message("/hermes_here", chat_id="-800", from_user_id="111")
+
+    plugin._on_dispatch(event=msg, gateway=None, session_store=None)
+
+    assert "-800" in plugin.os.environ.get("TELEGRAM_ALWAYS_OBSERVE_CHATS", "").split(",")
