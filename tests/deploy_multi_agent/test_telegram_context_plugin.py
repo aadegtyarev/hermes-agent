@@ -364,6 +364,32 @@ def test_register_installs_the_pre_tool_call_hook(plugin, monkeypatch):
     assert batch_tool_calls[0]["toolset"] == plugin._BATCH_REVIEW_TOOLSET
 
 
+def test_register_syncs_always_observe_chats_env_from_the_store_at_load_time(plugin, monkeypatch):
+    """On a fresh gateway process, TELEGRAM_ALWAYS_OBSERVE_CHATS starts
+    unset until SOME dispatch-eligible event reactively syncs it inside
+    _on_dispatch — meaning the very first plain (unmentioned) message in an
+    already-registered chat, right after a restart, would read an empty env
+    var and get dropped before anything ever populated it for next time.
+    register() must populate it immediately from whatever is already in the
+    store, closing that window."""
+    class FakeCtx:
+        def register_tool(self, **kw):
+            pass
+
+        def register_hook(self, name, handler):
+            pass
+
+        def register_command(self, **kw):
+            pass
+
+    monkeypatch.delenv("TELEGRAM_ALWAYS_OBSERVE_CHATS", raising=False)
+    plugin.store.set_chat("-800", "work", "", "111")
+
+    plugin.register(FakeCtx())
+
+    assert "-800" in plugin.os.environ.get("TELEGRAM_ALWAYS_OBSERVE_CHATS", "").split(",")
+
+
 # ── Nightly backup cron job registration ────────────────────────────────────
 
 def test_ensure_backup_cron_job_registers_once(plugin, tmp_path):
