@@ -13,6 +13,13 @@ def _fmt(rows: list[dict]) -> list[dict]:
     for r in rows:
         out.append({
             "message_id": r.get("message_id"),
+            # chat_id/chat_name matter most for a cross-chat telegram_search
+            # (chat_id=None) — without them a match gives no way to tell
+            # which chat to telegram_recent(chat_id=...) into next. Harmless
+            # (just redundant with the top-level chat_id) for the
+            # single-chat callers (telegram_thread/telegram_recent).
+            "chat_id": r.get("chat_id"),
+            "chat_name": r.get("chat_name") or None,
             "from": r.get("user_name") or r.get("user_id"),
             "reply_to": r.get("reply_to_message_id") or None,
             "reply_to_author": r.get("reply_to_author") or None,
@@ -69,9 +76,13 @@ TELEGRAM_RECENT = {"name": "telegram_recent", "description": (
 
 TELEGRAM_SEARCH = {"name": "telegram_search", "description": (
     "Text search across stored Telegram messages (optionally within one chat), "
-    "most recent matches by default. Pass since_hours_ago/until_hours_ago + "
-    "cursor to instead walk every match in a time window exhaustively — check "
-    "count_only first to see how many matches there are before paging."),
+    "most recent matches by default. Also matches by CHAT NAME/TITLE (returned "
+    "separately as 'matched_chats') — so asking about a client/partner/project "
+    "by name finds that chat even if it has no messages yet (e.g. right after "
+    "registration) or none that happen to contain the name itself. Pass "
+    "since_hours_ago/until_hours_ago + cursor to instead walk every match in a "
+    "time window exhaustively — check count_only first to see how many matches "
+    "there are before paging."),
     "parameters": {"type": "object", "properties": {
         "query": {"type": "string", "description": "Substring to search for."},
         "chat_id": {"type": "string", "description": "Restrict to a chat (default: all chats)."},
@@ -148,8 +159,17 @@ def handle_telegram_search(args, **kw):
     chat_id = str(args.get("chat_id") or "").strip() or None
     since_ts, until_ts = _since_until(args)
 
+    # Chat-NAME matches are cheap (a handful of known chats at most) and
+    # orthogonal to the message-content search below — always computed,
+    # never paginated. Scoped to the same single chat_id when the caller
+    # restricted to one (matches the message-search scoping exactly).
+    matched_chats = store.search_chat_titles(q, chat_ids=[chat_id] if chat_id else None)
+
     if args.get("count_only"):
-        return tool_result({"query": q, **store.count(chat_id, since_ts, until_ts, query=q)})
+        return tool_result({
+            "query": q, "matched_chats": matched_chats,
+            **store.count(chat_id, since_ts, until_ts, query=q),
+        })
 
     try:
         limit = int(args.get("limit", 50))
@@ -160,7 +180,8 @@ def handle_telegram_search(args, **kw):
 
     page = store.search(q, chat_id, min(limit, 500), since_ts, until_ts, after_id)
     return tool_result({
-        "query": q, "count": len(page["messages"]), "matches": _fmt(page["messages"]),
+        "query": q, "matched_chats": matched_chats,
+        "count": len(page["messages"]), "matches": _fmt(page["messages"]),
         "has_more": page["has_more"], "next_cursor": page["next_cursor"],
     })
 
@@ -320,8 +341,13 @@ PROGRAM_CLIENT_CHATS_SCHEMA = {"name": "program_client_chats", "description": (
     "activity, last-reviewed time, message count), newest-active first — then read "
     "each with telegram_recent(chat_id=…). With 'query' it returns only the client "
     "chats that match: by title, and by message content (full-text, so you can find "
-    "'the chat where CAN bus came up'). Returns nothing outside a team chat; a "
-    "client chat cannot use this to see sibling chats."),
+    "'the chat where CAN bus came up'). For a one-off 'which chat is <name>?' or "
+    "'do you see messages about <name>?' question, telegram_search already covers "
+    "it too (it matches chat titles as well, via its own 'matched_chats'); reach "
+    "for THIS tool specifically when you want the whole program's client-chat list "
+    "at once (a digest, 'what's up across all our client chats') rather than one "
+    "lookup. Returns nothing outside a team chat; a client chat cannot use this to "
+    "see sibling chats."),
     "parameters": {"type": "object", "properties": {
         "query": {"type": "string", "description": "Optional. Filter to client chats matching this in their title or message text. Omit to list all."},
         "since_hours_ago": {"type": "number", "description": "Optional. With 'query', only match messages from at most this many hours ago."},

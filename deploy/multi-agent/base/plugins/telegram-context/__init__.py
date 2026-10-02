@@ -19,7 +19,11 @@ One `pre_gateway_dispatch` hook does four things for Telegram:
      gateway's default "here's your pairing code" flow, so that flow never fires for
      non-members here).
   4. Ingest — stores messages so telegram_thread/recent/search can read history the
-     Bot API can't fetch.
+     Bot API can't fetch. Also keeps a chat_id→title index (store.chat_titles,
+     separate from the message FTS index) fresh on every message, so telegram_search
+     can match a chat by NAME even with zero messages ingested yet (a chat's title is
+     known at registration time — set_chat()/create_program() seed it immediately —
+     well before anyone's actually typed anything there).
 
 A separate `pre_tool_call` hook (`_pre_tool_call`) hard-blocks `send_message`
 tool calls whose target resolves to a read-only chat — the actual "never
@@ -581,7 +585,7 @@ def _handle_hermes_program(chat_id: str, uid: str, title: str, raw_text: str):
             return _HANDLED
         if uid not in _admin_users():
             return _NON_ADMIN_SILENT
-        ok = store.create_program(arg, chat_id, uid)
+        ok = store.create_program(arg, chat_id, uid, title=title)
         _send(chat_id, f"✅ Программа «{arg}» создана — этот чат теперь её команда." if ok
               else f"Не удалось создать «{arg}»: имя занято, или этот чат уже зарегистрирован.")
         return _HANDLED
@@ -901,6 +905,7 @@ def _ingest(event) -> None:
     chat_id = str(getattr(src, "chat_id", "") or "")
     uid = str(getattr(src, "user_id", "") or "")
     text = getattr(event, "text", "") or ""
+    chat_name = getattr(src, "chat_name", "") or ""
     store.add({
         "chat_id": chat_id,
         "message_id": str(getattr(event, "message_id", "") or ""),
@@ -908,12 +913,17 @@ def _ingest(event) -> None:
         "user_id": uid,
         "user_name": getattr(src, "user_name", "") or "",
         "chat_type": getattr(src, "chat_type", "") or "",
-        "chat_name": getattr(src, "chat_name", "") or "",
+        "chat_name": chat_name,
         "thread_id": str(getattr(src, "thread_id", "") or ""),
         "text": text,
         "reply_to_message_id": str(getattr(event, "reply_to_message_id", "") or ""),
         "reply_to_author": getattr(event, "reply_to_author_name", "") or "",
     })
+    # Keeps the title index current for ANY chat the bot observes — not just
+    # explicitly /hermes_*-registered ones (an env-configured TELEGRAM_WORK_
+    # CHATS entry, say) — and picks up a rename, since set_chat()'s own
+    # upsert only ever fires once, at registration time.
+    store.upsert_chat_title(chat_id, chat_name)
     _link_chat_docs(chat_id, text, uid)
 
 

@@ -167,3 +167,78 @@ def test_backfill_indexes_rows_inserted_via_raw_sql(store, tmp_path):
 
     page = store.search("бэкфилл", "C1", 50)
     assert [m["message_id"] for m in page["messages"]] == ["raw"]
+
+
+# ── Chat title indexing: searchable by name independent of message content ──
+
+def test_upsert_and_search_chat_title_roundtrip(store):
+    store.upsert_chat_title("-100700", "WB+Innel (интеграция)")
+
+    hits = store.search_chat_titles("Innel")
+
+    assert [h["chat_id"] for h in hits] == ["-100700"]
+    assert hits[0]["title"] == "WB+Innel (интеграция)"
+
+
+def test_chat_title_findable_with_zero_messages(store):
+    """The whole point: a freshly-registered chat has a title but no
+    messages yet — must still be findable by name."""
+    store.upsert_chat_title("-100700", "WB+Innel (интеграция)")
+
+    assert store.search_chat_titles("Innel") != []
+    # No message ever ingested for this chat_id — content search finds nothing,
+    # which is fine; title search is what must succeed.
+    assert store.search("Innel", "-100700", 50)["messages"] == []
+
+
+def test_chat_title_search_is_case_and_cyrillic_insensitive(store):
+    store.upsert_chat_title("-100500", "Аквариум Групп")
+
+    hits = store.search_chat_titles("АКВАРИУМ")
+
+    assert [h["chat_id"] for h in hits] == ["-100500"]
+
+
+def test_chat_title_search_restricted_to_given_chat_ids(store):
+    store.upsert_chat_title("-100700", "WB+Innel")
+    store.upsert_chat_title("-100800", "WB+Innel Backup")
+
+    scoped = store.search_chat_titles("Innel", chat_ids=["-100700"])
+
+    assert [h["chat_id"] for h in scoped] == ["-100700"]
+
+
+def test_chat_title_search_no_match_returns_empty(store):
+    store.upsert_chat_title("-100700", "WB+Innel")
+
+    assert store.search_chat_titles("nonexistent") == []
+
+
+def test_upsert_chat_title_empty_title_is_a_noop(store):
+    store.upsert_chat_title("-100700", "")
+    assert store.search_chat_titles("anything") == []
+
+
+def test_upsert_chat_title_overwrites_on_rename(store):
+    store.upsert_chat_title("-100700", "Old Name")
+    store.upsert_chat_title("-100700", "New Name")
+
+    assert store.search_chat_titles("Old") == []
+    hits = store.search_chat_titles("New")
+    assert hits[0]["title"] == "New Name"
+
+
+def test_set_chat_automatically_indexes_the_title(store):
+    store.set_chat("-100700", "client", "WB+Innel (интеграция)", "111", program="integration")
+
+    hits = store.search_chat_titles("Innel")
+
+    assert [h["chat_id"] for h in hits] == ["-100700"]
+
+
+def test_create_program_automatically_indexes_the_team_chat_title(store):
+    store.create_program("integration", "-100500", "111", title="Integration Team")
+
+    hits = store.search_chat_titles("Integration Team")
+
+    assert [h["chat_id"] for h in hits] == ["-100500"]
