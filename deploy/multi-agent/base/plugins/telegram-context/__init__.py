@@ -51,7 +51,12 @@ TELEGRAM_ADMIN_USERS can enrol the current chat with a command — no file edits
   /hermes_forget           → drop this chat from the runtime list; inside a program's
                              team chat with client chats attached, asks for
                              "/hermes_forget confirm" before cascading the delete to them
-  /hermes_chats            → show the runtime list (with per-program client-chat counts)
+  /hermes_chats [filter]   → inside a program's own team chat: ONLY that program's own
+                             client chats (name + join link if available), optionally
+                             filtered by title (casefold — works for Cyrillic), own
+                             team-member trust, not global-admin-only. Anywhere else:
+                             the full global dump (with per-program client-chat counts),
+                             unchanged, still global-admin-only
   /hermes_program_rename   → rename a program, from inside its own team chat
   /hermes_program_move     → re-point a program's team chat to the current (fresh) chat
   /hermes_invite_link      → force a fresh invite link for a client chat (own team-member
@@ -364,9 +369,14 @@ _CHAT_COMMANDS = {
 # same bar as creating a program in the first place, unlike registering a
 # client chat under an existing one.
 _GLOBAL_ADMIN_COMMANDS = {
-    "/hermes_here", "/hermes_readonly", "/hermes_forget", "/hermes_chats",
+    "/hermes_here", "/hermes_readonly", "/hermes_forget",
     "/hermes_program_rename", "/hermes_program_move",
 }
+# /hermes_chats is NOT in this set either — like /hermes_program, it has its
+# own contextual auth (see _handle_hermes_chats): run inside a program's own
+# team chat, it's scoped to that program's own client chats and open to any
+# LIVE team-chat member; anywhere else it falls back to the full global dump,
+# which stays global-admin-only.
 
 # Menu descriptions for the /hermes_* admin commands. Registering them as plugin
 # slash commands makes them show up in Telegram's "/" menu (private chats — the
@@ -378,7 +388,7 @@ _MENU_COMMANDS = (
     ("hermes_here", "Сделать этот чат рабочим (бот отвечает)"),
     ("hermes_readonly", "Сделать чат read-only (только наблюдение)"),
     ("hermes_forget", "Убрать этот чат из списка"),
-    ("hermes_chats", "Показать список чатов"),
+    ("hermes_chats", "Показать чаты (в чате команды — только свои client-чаты + ссылки)"),
     ("hermes_program", "Создать программу / зарегистрировать клиентский чат"),
     ("hermes_program_rename", "Переименовать программу (из её чата команды)"),
     ("hermes_program_move", "Перенести чат команды программы в этот чат"),
@@ -693,6 +703,67 @@ def _handle_invite_link_regenerate(chat_id: str, uid: str, raw_text: str):
     return _HANDLED
 
 
+def _handle_hermes_chats(chat_id: str, uid: str, raw_text: str):
+    """``/hermes_chats [filter]`` — two shapes, same contextual-auth pattern
+    as ``/hermes_program``/``/hermes_invite_link``:
+
+    - Run inside a program's own team chat: lists ONLY that program's own
+      client chats — name + join link if one is available — never the
+      unrelated global work-chat/other-programs' clutter a full dump would
+      include. Open to any LIVE member of that team chat (not just a global
+      admin) — the whole point is letting a colleague pull up and join any
+      of their own project's client chats themselves, same trust as
+      registering one in the first place.
+    - Anywhere else (including a DM — chat_id there is the caller's own
+      user_id, which never matches a team chat): the original global dump
+      of every work/readonly/client chat + every program's team chat,
+      unchanged, still global-admin-only.
+
+    ``filter`` (optional) narrows the team-chat listing to chats whose
+    title contains it, matched via ``casefold()`` — case-insensitive and
+    correct for Cyrillic, unlike plain ``.lower()`` for some scripts.
+    """
+    program = store.program_by_team_chat(chat_id)
+    if program:
+        if not _user_is_member_of_chat(uid, chat_id):
+            return _NON_ADMIN_SILENT
+        parts = raw_text.split(maxsplit=1)
+        query = parts[1].strip().casefold() if len(parts) > 1 else ""
+        chats = store.program_client_chats(program)
+        if query:
+            chats = [c for c in chats if query in (c.get("title") or "").casefold()]
+        if not chats:
+            suffix = f" по запросу «{parts[1].strip()}»" if query else ""
+            _send(chat_id, f"Клиентских чатов программы «{program}»{suffix} не найдено.")
+            return _HANDLED
+        lines = []
+        for c in chats:
+            title = c.get("title") or c["chat_id"]
+            invite = _get_invite_link(c["chat_id"])
+            lines.append(f"• {title} — вступить: {invite}" if invite else f"• {title} — ссылка недоступна")
+        _send(chat_id, f"Клиентские чаты программы «{program}»:\n" + "\n".join(lines))
+        return _HANDLED
+
+    if uid not in _admin_users():
+        return _NON_ADMIN_SILENT
+    rows = store.list_chats()
+    progs = store.programs()
+    lines = [f"• {r['mode']}: {r['chat_id']}"
+             + (f" [{r['program']}]" if r.get("program") else "")
+             + (f" — {r['title']}" if r.get("title") else "")
+             for r in rows]
+    lines += [
+        f"• program «{name}»: team chat {chat} "
+        f"({len(store.program_client_chats(name))} клиентских чатов)"
+        for name, chat in progs.items()
+    ]
+    if lines:
+        _send(chat_id, "Динамический список:\n" + "\n".join(lines))
+    else:
+        _send(chat_id, "Динамический список пуст (чаты также могут быть заданы через .env).")
+    return _HANDLED
+
+
 def _handle_command(event, src, chat_id: str, uid: str, ctype: str = ""):
     """If the message is a /hermes_* chat-admin command, act on it and return a skip
     action (so it isn't forwarded to the agent). Returns None if not a command."""
@@ -715,6 +786,14 @@ def _handle_command(event, src, chat_id: str, uid: str, ctype: str = ""):
             # program-admin status) to their own private chat with the bot.
             return _NON_ADMIN_SILENT
         return _handle_hermes_program(chat_id, uid, title, text)
+
+    if cmd == "/hermes_chats":
+        # No DM refusal here (unlike /hermes_program/_invite_link): a DM's
+        # chat_id is the caller's own user_id, which never resolves to a
+        # program's team chat, so _handle_hermes_chats naturally falls
+        # through to its global-admin-gated dump — the pre-existing,
+        # intentionally DM-reachable behavior stays unchanged.
+        return _handle_hermes_chats(chat_id, uid, text)
 
     if cmd == "/hermes_invite_link":
         if ctype == "dm":
@@ -779,22 +858,6 @@ def _handle_command(event, src, chat_id: str, uid: str, ctype: str = ""):
                 _send(chat_id, "🗑 Чат убран из списка.")
             else:
                 _send(chat_id, "Этого чата нет в динамическом списке (возможно, он задан через .env).")
-    elif cmd == "/hermes_chats":
-        rows = store.list_chats()
-        progs = store.programs()
-        lines = [f"• {r['mode']}: {r['chat_id']}"
-                 + (f" [{r['program']}]" if r.get("program") else "")
-                 + (f" — {r['title']}" if r.get("title") else "")
-                 for r in rows]
-        lines += [
-            f"• program «{name}»: team chat {chat} "
-            f"({len(store.program_client_chats(name))} клиентских чатов)"
-            for name, chat in progs.items()
-        ]
-        if lines:
-            _send(chat_id, "Динамический список:\n" + "\n".join(lines))
-        else:
-            _send(chat_id, "Динамический список пуст (чаты также могут быть заданы через .env).")
     return _HANDLED
 
 
