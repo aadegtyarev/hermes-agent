@@ -382,7 +382,11 @@ def search_in_chats(query: str, chat_ids: list[str], limit: int,
 
 
 def remove_program_by_chat(chat_id: str) -> str | None:
-    """Drop the program whose team chat is ``chat_id``. Returns its name, or None."""
+    """Drop the program whose team chat is ``chat_id``. Returns its name, or None.
+
+    Leaves any client chats registered under that program untouched (their
+    ``chats_allowed.program`` text still names it) — use
+    :func:`remove_program_cascade` to also tear those down."""
     if not chat_id:
         return None
     with _LOCK, _conn() as c:
@@ -391,6 +395,79 @@ def remove_program_by_chat(chat_id: str) -> str | None:
             return None
         c.execute("DELETE FROM partner_programs WHERE chat_id=?", (str(chat_id),))
         return r["program"]
+
+
+def rename_program(old_name: str, new_name: str) -> bool:
+    """Rename a program and re-point every client chat registered under it.
+
+    Client chats reference a program by NAME, not by its team chat_id
+    (``chats_allowed.program``) — so a rename is a pure text relabel, no
+    chat_id bookkeeping needed. Returns False (no-op) if ``old_name`` doesn't
+    exist, ``new_name`` fails the same format check as :func:`create_program`,
+    or ``new_name`` is already taken by a different program.
+    """
+    if not old_name or not new_name or not _PROGRAM_NAME_RE.match(new_name):
+        return False
+    with _LOCK, _conn() as c:
+        if not c.execute("SELECT 1 FROM partner_programs WHERE program=?", (old_name,)).fetchone():
+            return False
+        if new_name != old_name and c.execute(
+                "SELECT 1 FROM partner_programs WHERE program=?", (new_name,)).fetchone():
+            return False
+        c.execute("UPDATE partner_programs SET program=? WHERE program=?", (new_name, old_name))
+        c.execute("UPDATE chats_allowed SET program=? WHERE program=?", (new_name, old_name))
+        return True
+
+
+def move_program_chat(program: str, new_chat_id: str) -> bool:
+    """Re-point ``program``'s team chat to ``new_chat_id``.
+
+    Client chats are unaffected (same reason as :func:`rename_program` — they
+    reference the program by name, never by its team chat_id). Returns False
+    if ``program`` doesn't exist or ``new_chat_id`` is already registered as
+    something else (a client chat, another program's team chat, or a static
+    work/readonly chat) — callers check the env-configured sets themselves
+    (this store has no visibility into those), same division of
+    responsibility as :func:`create_program`.
+    """
+    if not program or not new_chat_id:
+        return False
+    with _LOCK, _conn() as c:
+        if not c.execute("SELECT 1 FROM partner_programs WHERE program=?", (program,)).fetchone():
+            return False
+        if c.execute("SELECT 1 FROM partner_programs WHERE chat_id=?", (str(new_chat_id),)).fetchone():
+            return False
+        if c.execute("SELECT 1 FROM chats_allowed WHERE chat_id=?", (str(new_chat_id),)).fetchone():
+            return False
+        c.execute(
+            "UPDATE partner_programs SET chat_id=? WHERE program=?", (str(new_chat_id), program)
+        )
+        return True
+
+
+def remove_program_cascade(program: str) -> list[str]:
+    """Delete a program AND every client chat registered under it.
+
+    Returns the list of client chat_ids that were removed (for the caller to
+    notify/echo) — the team-chat removal itself is reported by the caller via
+    the program name it already has. Clears each removed chat's accumulated
+    per-chat state too (see :func:`forget_chat_state`'s own docstring for why
+    that matters), same as a plain single-chat ``/hermes_forget``.
+    """
+    if not program:
+        return []
+    with _LOCK, _conn() as c:
+        client_rows = c.execute(
+            "SELECT chat_id FROM chats_allowed WHERE mode='client' AND program=?", (program,)
+        ).fetchall()
+        client_ids = [r["chat_id"] for r in client_rows]
+        c.execute("DELETE FROM partner_programs WHERE program=?", (program,))
+        c.execute("DELETE FROM chats_allowed WHERE mode='client' AND program=?", (program,))
+        for cid in client_ids:
+            c.execute("DELETE FROM chat_doc_links WHERE chat_id=?", (cid,))
+            c.execute("DELETE FROM chat_escalations WHERE chat_id=?", (cid,))
+            c.execute("DELETE FROM chat_review_state WHERE chat_id=?", (cid,))
+        return client_ids
 
 
 # ── Google Docs/Sheets links observed in a client chat ──────────────────────

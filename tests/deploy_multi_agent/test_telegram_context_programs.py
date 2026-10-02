@@ -462,3 +462,239 @@ def test_program_team_chat_messages_are_ingested(plugin):
 
     page = plugin.store.recent("-500", 10)
     assert [m["text"] for m in page["messages"]] == ["team note"]
+
+
+# ── store.py: rename_program / move_program_chat / remove_program_cascade ──
+
+def test_rename_program_carries_client_chats_along(plugin):
+    plugin.store.create_program("journalist-partners", "-500", "111")
+    plugin.store.set_chat("-700", "client", "Acme", "222", program="journalist-partners")
+
+    assert plugin.store.rename_program("journalist-partners", "press-partners")
+
+    assert plugin.store.programs() == {"press-partners": "-500"}
+    assert plugin.store.chat_program("-700") == "press-partners"
+
+
+def test_rename_program_rejects_unknown_old_name(plugin):
+    assert not plugin.store.rename_program("ghost", "new-name")
+
+
+def test_rename_program_rejects_name_already_taken(plugin):
+    plugin.store.create_program("journalist-partners", "-500", "111")
+    plugin.store.create_program("support-clients", "-600", "111")
+    assert not plugin.store.rename_program("journalist-partners", "support-clients")
+    assert plugin.store.program_chat_id("journalist-partners") == "-500"
+
+
+def test_rename_program_rejects_invalid_new_name(plugin):
+    plugin.store.create_program("journalist-partners", "-500", "111")
+    assert not plugin.store.rename_program("journalist-partners", "has spaces")
+    assert plugin.store.programs() == {"journalist-partners": "-500"}
+
+
+def test_move_program_chat_repoints_team_chat_only(plugin):
+    plugin.store.create_program("journalist-partners", "-500", "111")
+    plugin.store.set_chat("-700", "client", "Acme", "222", program="journalist-partners")
+
+    assert plugin.store.move_program_chat("journalist-partners", "-900")
+
+    assert plugin.store.program_chat_id("journalist-partners") == "-900"
+    assert plugin.store.is_program_team_chat("-900")
+    assert not plugin.store.is_program_team_chat("-500")
+    assert plugin.store.chat_program("-700") == "journalist-partners"  # untouched
+
+
+def test_move_program_chat_rejects_unknown_program(plugin):
+    assert not plugin.store.move_program_chat("ghost", "-900")
+
+
+def test_move_program_chat_rejects_target_already_registered(plugin):
+    plugin.store.create_program("journalist-partners", "-500", "111")
+    plugin.store.set_chat("-900", "work", "", "111")
+    assert not plugin.store.move_program_chat("journalist-partners", "-900")
+    assert plugin.store.program_chat_id("journalist-partners") == "-500"
+
+
+def test_remove_program_cascade_drops_program_and_its_client_chats(plugin):
+    plugin.store.create_program("journalist-partners", "-500", "111")
+    plugin.store.set_chat("-700", "client", "Acme", "222", program="journalist-partners")
+    plugin.store.set_chat("-800", "client", "Globex", "222", program="journalist-partners")
+    plugin.store.link_chat_doc("-700", "SOME_DOC")
+
+    removed = plugin.store.remove_program_cascade("journalist-partners")
+
+    assert set(removed) == {"-700", "-800"}
+    assert plugin.store.programs() == {}
+    assert plugin.store.chat_mode("-700") is None
+    assert plugin.store.chat_mode("-800") is None
+    assert plugin.store.chat_doc_ids("-700") == set()
+
+
+def test_remove_program_cascade_unknown_program_is_noop(plugin):
+    assert plugin.store.remove_program_cascade("ghost") == []
+
+
+# ── /hermes_program_rename ───────────────────────────────────────────────────
+
+def test_admin_renames_program_from_its_team_chat(plugin, monkeypatch):
+    monkeypatch.setenv("TELEGRAM_ADMIN_USERS", "111")
+    plugin.store.create_program("journalist-partners", "-500", "111")
+    sent = []
+    monkeypatch.setattr(plugin, "_send", lambda chat_id, text: sent.append((chat_id, text)))
+
+    msg = _group_message("/hermes_program_rename press-partners", chat_id="-500", from_user_id="111")
+    result = plugin._handle_command(msg, msg.source, "-500", "111")
+
+    assert result == plugin._HANDLED
+    assert plugin.store.programs() == {"press-partners": "-500"}
+    assert "переименована" in sent[0][1]
+
+
+def test_non_admin_cannot_rename_program(plugin, monkeypatch):
+    monkeypatch.setenv("TELEGRAM_ADMIN_USERS", "111")
+    plugin.store.create_program("journalist-partners", "-500", "111")
+    _member(plugin, "-500", "222")  # a live team member, but not a global admin
+    sent = []
+    monkeypatch.setattr(plugin, "_send", lambda chat_id, text: sent.append((chat_id, text)))
+
+    msg = _group_message("/hermes_program_rename press-partners", chat_id="-500", from_user_id="222")
+    result = plugin._handle_command(msg, msg.source, "-500", "222")
+
+    assert result == plugin._NON_ADMIN_SILENT
+    assert plugin.store.programs() == {"journalist-partners": "-500"}
+    assert sent == []
+
+
+def test_rename_outside_a_team_chat_is_rejected(plugin, monkeypatch):
+    monkeypatch.setenv("TELEGRAM_ADMIN_USERS", "111")
+    sent = []
+    monkeypatch.setattr(plugin, "_send", lambda chat_id, text: sent.append((chat_id, text)))
+
+    msg = _group_message("/hermes_program_rename press-partners", chat_id="-999", from_user_id="111")
+    result = plugin._handle_command(msg, msg.source, "-999", "111")
+
+    assert result == plugin._HANDLED
+    assert "только внутри чата команды" in sent[0][1]
+
+
+def test_rename_silently_refused_from_a_dm(plugin, monkeypatch):
+    monkeypatch.setenv("TELEGRAM_ADMIN_USERS", "111")
+    plugin.store.create_program("journalist-partners", "-500", "111")
+    sent = []
+    monkeypatch.setattr(plugin, "_send", lambda chat_id, text: sent.append((chat_id, text)))
+
+    msg = _group_message("/hermes_program_rename press-partners", chat_id="-500", from_user_id="111")
+    result = plugin._handle_command(msg, msg.source, "-500", "111", "dm")
+
+    assert result == plugin._NON_ADMIN_SILENT
+    assert plugin.store.programs() == {"journalist-partners": "-500"}
+    assert sent == []
+
+
+# ── /hermes_program_move ─────────────────────────────────────────────────────
+
+def test_admin_moves_program_to_a_fresh_chat(plugin, monkeypatch):
+    monkeypatch.setenv("TELEGRAM_ADMIN_USERS", "111")
+    plugin.store.create_program("journalist-partners", "-500", "111")
+    sent = []
+    monkeypatch.setattr(plugin, "_send", lambda chat_id, text: sent.append((chat_id, text)))
+
+    msg = _group_message("/hermes_program_move journalist-partners", chat_id="-900", from_user_id="111")
+    result = plugin._handle_command(msg, msg.source, "-900", "111")
+
+    assert result == plugin._HANDLED
+    assert plugin.store.program_chat_id("journalist-partners") == "-900"
+    chat_ids_sent = {c for c, _ in sent}
+    assert "-900" in chat_ids_sent and "-500" in chat_ids_sent  # new + old team chat notified
+
+
+def test_move_refuses_an_already_registered_target_chat(plugin, monkeypatch):
+    monkeypatch.setenv("TELEGRAM_ADMIN_USERS", "111")
+    plugin.store.create_program("journalist-partners", "-500", "111")
+    plugin.store.set_chat("-900", "work", "", "111")
+    sent = []
+    monkeypatch.setattr(plugin, "_send", lambda chat_id, text: sent.append((chat_id, text)))
+
+    msg = _group_message("/hermes_program_move journalist-partners", chat_id="-900", from_user_id="111")
+    result = plugin._handle_command(msg, msg.source, "-900", "111")
+
+    assert result == plugin._HANDLED
+    assert plugin.store.program_chat_id("journalist-partners") == "-500"
+    assert "уже зарегистрирован" in sent[0][1]
+
+
+def test_move_unknown_program_name_reports_not_found(plugin, monkeypatch):
+    monkeypatch.setenv("TELEGRAM_ADMIN_USERS", "111")
+    sent = []
+    monkeypatch.setattr(plugin, "_send", lambda chat_id, text: sent.append((chat_id, text)))
+
+    msg = _group_message("/hermes_program_move ghost", chat_id="-900", from_user_id="111")
+    result = plugin._handle_command(msg, msg.source, "-900", "111")
+
+    assert result == plugin._HANDLED
+    assert "не найдена" in sent[0][1]
+
+
+def test_non_admin_cannot_move_program(plugin, monkeypatch):
+    monkeypatch.setenv("TELEGRAM_ADMIN_USERS", "111")
+    plugin.store.create_program("journalist-partners", "-500", "111")
+    sent = []
+    monkeypatch.setattr(plugin, "_send", lambda chat_id, text: sent.append((chat_id, text)))
+
+    msg = _group_message("/hermes_program_move journalist-partners", chat_id="-900", from_user_id="222")
+    result = plugin._handle_command(msg, msg.source, "-900", "222")
+
+    assert result == plugin._NON_ADMIN_SILENT
+    assert plugin.store.program_chat_id("journalist-partners") == "-500"
+    assert sent == []
+
+
+# ── /hermes_forget: cascade-with-confirm on a program's team chat ───────────
+
+def test_forget_team_chat_with_no_clients_deletes_immediately(plugin, monkeypatch):
+    monkeypatch.setenv("TELEGRAM_ADMIN_USERS", "111")
+    plugin.store.create_program("journalist-partners", "-500", "111")
+    sent = []
+    monkeypatch.setattr(plugin, "_send", lambda chat_id, text: sent.append((chat_id, text)))
+
+    msg = _group_message("/hermes_forget", chat_id="-500", from_user_id="111")
+    result = plugin._handle_command(msg, msg.source, "-500", "111")
+
+    assert result == plugin._HANDLED
+    assert plugin.store.programs() == {}
+    assert "удалена" in sent[0][1]
+
+
+def test_forget_team_chat_with_clients_asks_for_confirmation_first(plugin, monkeypatch):
+    monkeypatch.setenv("TELEGRAM_ADMIN_USERS", "111")
+    plugin.store.create_program("journalist-partners", "-500", "111")
+    plugin.store.set_chat("-700", "client", "Acme", "222", program="journalist-partners")
+    sent = []
+    monkeypatch.setattr(plugin, "_send", lambda chat_id, text: sent.append((chat_id, text)))
+
+    msg = _group_message("/hermes_forget", chat_id="-500", from_user_id="111")
+    result = plugin._handle_command(msg, msg.source, "-500", "111")
+
+    assert result == plugin._HANDLED
+    # Nothing was actually deleted yet.
+    assert plugin.store.programs() == {"journalist-partners": "-500"}
+    assert plugin.store.chat_mode("-700") == "client"
+    assert "confirm" in sent[0][1]
+
+
+def test_forget_confirm_cascades_to_every_client_chat(plugin, monkeypatch):
+    monkeypatch.setenv("TELEGRAM_ADMIN_USERS", "111")
+    plugin.store.create_program("journalist-partners", "-500", "111")
+    plugin.store.set_chat("-700", "client", "Acme", "222", program="journalist-partners")
+    plugin.store.set_chat("-800", "client", "Globex", "222", program="journalist-partners")
+    sent = []
+    monkeypatch.setattr(plugin, "_send", lambda chat_id, text: sent.append((chat_id, text)))
+
+    msg = _group_message("/hermes_forget confirm", chat_id="-500", from_user_id="111")
+    result = plugin._handle_command(msg, msg.source, "-500", "111")
+
+    assert result == plugin._HANDLED
+    assert plugin.store.programs() == {}
+    assert plugin.store.chat_mode("-700") is None
+    assert plugin.store.chat_mode("-800") is None
