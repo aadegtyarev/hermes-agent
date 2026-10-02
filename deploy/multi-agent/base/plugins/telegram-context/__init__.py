@@ -25,6 +25,33 @@ One `pre_gateway_dispatch` hook does four things for Telegram:
      known at registration time — set_chat()/create_program() seed it immediately —
      well before anyone's actually typed anything there).
 
+IMPORTANT, hard-won (2026-10-02): this hook does NOT fire for every incoming
+Telegram message by default. The core adapter's _should_process_message()
+(plugins/platforms/telegram/adapter.py) is the ONLY gate that leads to full
+event dispatch, where pre_gateway_dispatch hooks run; when it returns False
+(no @mention, no reply-to-bot, require_mention: true — the common case for
+ordinary chatter in a group), the message instead goes through
+_should_observe_unmentioned_group_message() -> _observe_unmentioned_group_
+message(), a SEPARATE core-only path. Neither gate knows about this
+plugin's own dynamic chat registry (chats_allowed/partner_programs) by
+default — they only read static config.yaml/env — so a /hermes_program- or
+/hermes_here-registered chat's ordinary messages were silently invisible to
+item 4 above until the bot was explicitly @mentioned or replied to in that
+chat. Fixed via two things, both load-bearing, do not remove either:
+  - _observe_unmentioned_group_message() now ALSO fires pre_gateway_dispatch
+    (see the core adapter), so this hook finally gets a chance to ingest.
+  - _sync_always_observe_chats_env() (below) bridges this plugin's own
+    work/client/readonly/team-chat registry into the core's
+    TELEGRAM_ALWAYS_OBSERVE_CHATS env var — read ONLY by
+    _should_observe_unmentioned_group_message, deliberately NEVER by
+    _should_process_message (unlike read_only_chats, which IS read by both
+    and therefore ALSO blocks normal dispatch — do not reuse that key for
+    this purpose, see its own docstring). Synced on every dispatch call
+    AND once at register() time, since a fresh gateway process otherwise
+    starts with this env var empty until some event happens to populate it.
+See AGENTS.md's "Known Pitfalls" for the full story, including how this was
+diagnosed on production (log/DB queries) if you need to re-verify any of it.
+
 A separate `pre_tool_call` hook (`_pre_tool_call`) hard-blocks `send_message`
 tool calls whose target resolves to a read-only chat — the actual "never
 writes there" guarantee, independent of dispatch gating above (which only
