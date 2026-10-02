@@ -15,18 +15,24 @@ from gateway.platforms.base import (
     SUPPORTED_DOCUMENT_TYPES,
     cache_document_from_bytes,
     cleanup_document_cache,
+    cleanup_video_cache,
     get_document_cache_dir,
+    get_video_cache_dir,
 )
 
 # ---------------------------------------------------------------------------
-# Fixture: redirect DOCUMENT_CACHE_DIR to a temp directory for every test
+# Fixture: redirect DOCUMENT_CACHE_DIR/VIDEO_CACHE_DIR to a temp directory for
+# every test
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(autouse=True)
 def _redirect_cache(tmp_path, monkeypatch):
-    """Point the module-level DOCUMENT_CACHE_DIR to a fresh tmp_path."""
+    """Point the module-level DOCUMENT_CACHE_DIR/VIDEO_CACHE_DIR to a fresh tmp_path."""
     monkeypatch.setattr(
         "gateway.platforms.base.DOCUMENT_CACHE_DIR", tmp_path / "doc_cache"
+    )
+    monkeypatch.setattr(
+        "gateway.platforms.base.VIDEO_CACHE_DIR", tmp_path / "video_cache"
     )
 
 
@@ -137,6 +143,48 @@ class TestCleanupDocumentCache:
 
     def test_empty_cache_dir(self):
         assert cleanup_document_cache(max_age_hours=24) == 0
+
+
+# ---------------------------------------------------------------------------
+# TestCleanupVideoCache — mirrors TestCleanupDocumentCache above; video had no
+# periodic cleanup at all before this (confirmed gap: unlike image/document,
+# nothing called a video equivalent anywhere), so an observed chat with video
+# traffic grew get_video_cache_dir() without bound.
+# ---------------------------------------------------------------------------
+
+class TestCleanupVideoCache:
+    def test_removes_old_files(self, tmp_path):
+        cache_dir = get_video_cache_dir()
+        old_file = cache_dir / "old.mp4"
+        old_file.write_bytes(b"old")
+        old_mtime = time.time() - 48 * 3600
+        os.utime(old_file, (old_mtime, old_mtime))
+
+        removed = cleanup_video_cache(max_age_hours=24)
+        assert removed == 1
+        assert not old_file.exists()
+
+    def test_keeps_recent_files(self):
+        cache_dir = get_video_cache_dir()
+        recent = cache_dir / "recent.mp4"
+        recent.write_bytes(b"fresh")
+
+        removed = cleanup_video_cache(max_age_hours=24)
+        assert removed == 0
+        assert recent.exists()
+
+    def test_returns_removed_count(self):
+        cache_dir = get_video_cache_dir()
+        old_time = time.time() - 48 * 3600
+        for i in range(3):
+            f = cache_dir / f"old_{i}.mp4"
+            f.write_bytes(b"x")
+            os.utime(f, (old_time, old_time))
+
+        assert cleanup_video_cache(max_age_hours=24) == 3
+
+    def test_empty_cache_dir(self):
+        assert cleanup_video_cache(max_age_hours=24) == 0
 
 
 # ---------------------------------------------------------------------------

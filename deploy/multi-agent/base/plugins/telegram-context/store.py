@@ -824,6 +824,20 @@ def add(row: dict) -> None:
         )
 
 
+def chat_has_recent_activity(chat_id: str, window_seconds: float, before_ts: float | None = None) -> bool:
+    """True if ``chat_id`` has any stored message within ``window_seconds``
+    before ``before_ts`` (default: now). Used to decide whether a chat counts
+    as an "active dialogue" for synchronous image auto-description."""
+    if not chat_id:
+        return False
+    cutoff = (before_ts if before_ts is not None else time.time()) - window_seconds
+    with _conn() as c:
+        return c.execute(
+            "SELECT 1 FROM messages WHERE chat_id=? AND ts>=? LIMIT 1",
+            (str(chat_id), cutoff),
+        ).fetchone() is not None
+
+
 def latest_chat() -> str | None:
     with _conn() as c:
         r = c.execute("SELECT chat_id FROM messages ORDER BY ts DESC LIMIT 1").fetchone()
