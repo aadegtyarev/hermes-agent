@@ -1245,6 +1245,48 @@ while the agent is blocked (e.g. approval prompts) MUST bypass BOTH
 guards and be dispatched inline, not via `_process_message_background()`
 (which races session lifecycle).
 
+### A plain (unmentioned) group message never reaches `pre_gateway_dispatch` unless something already decided to let it through
+`_should_process_message()` in `plugins/platforms/telegram/adapter.py` is
+the ONLY gate that leads to full event-building/dispatch — where
+`pre_gateway_dispatch` plugin hooks actually fire, from `gateway/run.py`.
+When it returns `False` (no mention, no reply, `require_mention: true`),
+the message takes a COMPLETELY SEPARATE path:
+`_should_observe_unmentioned_group_message()` decides whether to append it
+to the core's own internal transcript buffer via
+`_observe_unmentioned_group_message()`. Before a 2026-10-02 fix, that
+function never invoked ANY plugin hook at all — a plugin's own
+dynamically-registered chat (e.g. `telegram-context`'s
+`/hermes_program`-registered client/work chats) is invisible to BOTH
+gates by default (they only read static `config.yaml`/env, never a
+plugin's own SQLite registry), so an unmentioned message in such a chat
+was silently dropped — looked exactly like "the bot can't see a chat it
+was just added to," with zero trace in any log or store.
+
+Fix, now in place:
+- `_observe_unmentioned_group_message()` also fires `pre_gateway_dispatch`
+  (ingestion side effects only; the hook's returned action is ignored —
+  there is no dispatch decision left to make at that call site).
+- A new, narrow `TELEGRAM_ALWAYS_OBSERVE_CHATS` env /
+  `config.extra["always_observe_chats"]` key, read ONLY by
+  `_should_observe_unmentioned_group_message` — NEVER by
+  `_should_process_message` — lets a plugin bridge its own dynamic chat
+  registry into the observe gate without also blocking normal
+  mention/reply/command dispatch there. (That's the mistake mirroring into
+  `read_only_chats` made once already — see that env var's own docstring:
+  it's checked in BOTH gates, which is why it forces a hard "never
+  respond," and why it's the wrong tool for "also observe.")
+- A plugin doing this must sync the env var BOTH reactively (every
+  `pre_gateway_dispatch` call, so it tracks a registry that can change via
+  several admin-command code paths) AND once at plugin-load time
+  (`register(ctx)`) — reactive-only leaves a fresh-restart window where
+  the FIRST message in an already-registered chat can still race an empty
+  env var, with nothing left to populate it for next time.
+
+Reference implementation: `telegram-context/__init__.py`'s
+`_sync_always_observe_chats_env()` + `_telegram_always_observe_chats()` in
+the adapter. Full story (including the production repro and the exact
+log/DB queries used to trace it) in fork PRs #44, #45, #46.
+
 ### Squash merges from stale branches silently revert recent fixes
 Before squash-merging a PR, ensure the branch is up to date with `main`
 (`git fetch origin main && git reset --hard origin/main` in the worktree,
