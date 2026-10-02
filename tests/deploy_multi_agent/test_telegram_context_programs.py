@@ -698,3 +698,129 @@ def test_forget_confirm_cascades_to_every_client_chat(plugin, monkeypatch):
     assert plugin.store.programs() == {}
     assert plugin.store.chat_mode("-700") is None
     assert plugin.store.chat_mode("-800") is None
+
+
+# ── /hermes_chats: scoped-to-own-program view from inside a team chat ───────
+
+def test_hermes_chats_from_team_chat_lists_only_its_own_program(plugin, monkeypatch):
+    plugin.store.create_program("integration", "-500", "111")
+    plugin.store.create_program("support-clients", "-600", "999")
+    plugin.store.set_chat("-700", "client", "WB+Innel", "222", program="integration")
+    plugin.store.set_chat("-800", "client", "Other Co", "999", program="support-clients")
+    _member(plugin, "-500", "222")  # live team member, NOT a global admin
+    monkeypatch.setattr(plugin, "_get_invite_link", lambda chat_id: f"https://t.me/+{chat_id}")
+    sent = []
+    monkeypatch.setattr(plugin, "_send", lambda chat_id, text: sent.append((chat_id, text)))
+
+    msg = _group_message("/hermes_chats", chat_id="-500", from_user_id="222")
+    result = plugin._handle_command(msg, msg.source, "-500", "222")
+
+    assert result == plugin._HANDLED
+    text = sent[0][1]
+    assert "WB+Innel" in text
+    assert "https://t.me/+-700" in text
+    assert "Other Co" not in text  # sibling program must not leak
+
+
+def test_hermes_chats_scoped_view_shows_fallback_when_no_link_available(plugin, monkeypatch):
+    plugin.store.create_program("integration", "-500", "111")
+    plugin.store.set_chat("-700", "client", "WB+Innel", "222", program="integration")
+    _member(plugin, "-500", "222")
+    monkeypatch.setattr(plugin, "_get_invite_link", lambda chat_id: None)
+    sent = []
+    monkeypatch.setattr(plugin, "_send", lambda chat_id, text: sent.append((chat_id, text)))
+
+    msg = _group_message("/hermes_chats", chat_id="-500", from_user_id="222")
+    plugin._handle_command(msg, msg.source, "-500", "222")
+
+    assert "ссылка недоступна" in sent[0][1]
+
+
+def test_hermes_chats_filter_matches_title_case_insensitively(plugin, monkeypatch):
+    plugin.store.create_program("integration", "-500", "111")
+    plugin.store.set_chat("-700", "client", "WB+Innel (Aquara)", "222", program="integration")
+    plugin.store.set_chat("-800", "client", "Beta LLC", "222", program="integration")
+    _member(plugin, "-500", "222")
+    monkeypatch.setattr(plugin, "_get_invite_link", lambda chat_id: None)
+    sent = []
+    monkeypatch.setattr(plugin, "_send", lambda chat_id, text: sent.append((chat_id, text)))
+
+    msg = _group_message("/hermes_chats AQUARA", chat_id="-500", from_user_id="222")
+    plugin._handle_command(msg, msg.source, "-500", "222")
+
+    text = sent[0][1]
+    assert "WB+Innel" in text
+    assert "Beta LLC" not in text
+
+
+def test_hermes_chats_filter_supports_cyrillic_case_folding(plugin, monkeypatch):
+    plugin.store.create_program("integration", "-500", "111")
+    plugin.store.set_chat("-700", "client", "Аквариум Групп", "222", program="integration")
+    _member(plugin, "-500", "222")
+    monkeypatch.setattr(plugin, "_get_invite_link", lambda chat_id: None)
+    sent = []
+    monkeypatch.setattr(plugin, "_send", lambda chat_id, text: sent.append((chat_id, text)))
+
+    msg = _group_message("/hermes_chats АКВАРИУМ", chat_id="-500", from_user_id="222")
+    plugin._handle_command(msg, msg.source, "-500", "222")
+
+    assert "Аквариум Групп" in sent[0][1]
+
+
+def test_hermes_chats_filter_with_no_match_says_so(plugin, monkeypatch):
+    plugin.store.create_program("integration", "-500", "111")
+    plugin.store.set_chat("-700", "client", "WB+Innel", "222", program="integration")
+    _member(plugin, "-500", "222")
+    sent = []
+    monkeypatch.setattr(plugin, "_send", lambda chat_id, text: sent.append((chat_id, text)))
+
+    msg = _group_message("/hermes_chats nonexistent", chat_id="-500", from_user_id="222")
+    result = plugin._handle_command(msg, msg.source, "-500", "222")
+
+    assert result == plugin._HANDLED
+    assert "не найдено" in sent[0][1]
+
+
+def test_hermes_chats_non_team_member_cannot_see_the_scoped_list(plugin, monkeypatch):
+    plugin.store.create_program("integration", "-500", "111")
+    plugin.store.set_chat("-700", "client", "WB+Innel", "222", program="integration")
+    # uid 333 is NOT a live member of the team chat -500.
+    sent = []
+    monkeypatch.setattr(plugin, "_send", lambda chat_id, text: sent.append((chat_id, text)))
+
+    msg = _group_message("/hermes_chats", chat_id="-500", from_user_id="333")
+    result = plugin._handle_command(msg, msg.source, "-500", "333")
+
+    assert result == plugin._NON_ADMIN_SILENT
+    assert sent == []
+
+
+def test_hermes_chats_outside_a_team_chat_still_needs_global_admin(plugin, monkeypatch):
+    """Regression guard: the scoped view is a NEW relaxation for team-chat
+    members only — the full global dump from anywhere else must stay exactly
+    as admin-gated as before."""
+    plugin.store.create_program("integration", "-500", "111")
+    sent = []
+    monkeypatch.setattr(plugin, "_send", lambda chat_id, text: sent.append((chat_id, text)))
+
+    msg = _group_message("/hermes_chats", chat_id="-900", from_user_id="222")  # not a team chat
+    result = plugin._handle_command(msg, msg.source, "-900", "222")
+
+    assert result == plugin._NON_ADMIN_SILENT
+    assert sent == []
+
+
+def test_hermes_chats_global_dump_still_works_for_an_admin(plugin, monkeypatch):
+    monkeypatch.setenv("TELEGRAM_ADMIN_USERS", "111")
+    plugin.store.create_program("integration", "-500", "111")
+    plugin.store.set_chat("-800", "work", "WB Общий", "111")
+    sent = []
+    monkeypatch.setattr(plugin, "_send", lambda chat_id, text: sent.append((chat_id, text)))
+
+    msg = _group_message("/hermes_chats", chat_id="-900", from_user_id="111")  # not a team chat
+    result = plugin._handle_command(msg, msg.source, "-900", "111")
+
+    assert result == plugin._HANDLED
+    text = sent[0][1]
+    assert "WB Общий" in text
+    assert "program «integration»" in text
