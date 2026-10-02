@@ -207,6 +207,85 @@ def init() -> None:
                 chat_id TEXT PRIMARY KEY, invite_link TEXT, cached_ts REAL)"""
         )
 
+        # Known display title per chat_id — independent of whether that chat
+        # has any INGESTED MESSAGE yet. Without this, a freshly-registered
+        # client chat (title known at registration time, zero messages so
+        # far) is invisible to telegram_search: messages_fts only ever
+        # indexes message TEXT, and a brand-new chat has none. Kept as its
+        # own small FTS5 index (not folded into messages_fts) so one row per
+        # chat_id stays easy to upsert/refresh — a chat's title can change
+        # (renamed group) and update_chat_title() just overwrites the row,
+        # no per-message bookkeeping. Populated from set_chat()/
+        # create_program() at registration time AND from every ingested
+        # message's own chat_name (see _ingest() in __init__.py) so it also
+        # covers chats that were never explicitly registered (e.g. a
+        # TELEGRAM_WORK_CHATS env-configured chat) and stays fresh if a chat
+        # gets renamed later.
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS chat_titles(
+                chat_id TEXT PRIMARY KEY, title TEXT, updated_ts REAL)"""
+        )
+        c.execute(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS chat_titles_fts USING fts5("
+            "title, content='chat_titles', content_rowid='rowid')"
+        )
+        c.execute(
+            "CREATE TRIGGER IF NOT EXISTS chat_titles_ai AFTER INSERT ON chat_titles BEGIN "
+            "INSERT INTO chat_titles_fts(rowid, title) VALUES (new.rowid, new.title); END"
+        )
+        c.execute(
+            "CREATE TRIGGER IF NOT EXISTS chat_titles_ad AFTER DELETE ON chat_titles BEGIN "
+            "INSERT INTO chat_titles_fts(chat_titles_fts, rowid, title) VALUES('delete', old.rowid, old.title); END"
+        )
+        c.execute(
+            "CREATE TRIGGER IF NOT EXISTS chat_titles_au AFTER UPDATE ON chat_titles BEGIN "
+            "INSERT INTO chat_titles_fts(chat_titles_fts, rowid, title) VALUES('delete', old.rowid, old.title); "
+            "INSERT INTO chat_titles_fts(rowid, title) VALUES (new.rowid, new.title); END"
+        )
+
+
+def upsert_chat_title(chat_id: str, title: str) -> None:
+    """Record/refresh the known display title for ``chat_id``.
+
+    A no-op for an empty title (never overwrite a known title with "no
+    title" — ingest events for a chat_type without a title, like a DM,
+    pass an empty chat_name; that must not clobber a group's real one if
+    the two ever share a chat_id namespace collision, which can't actually
+    happen today but costs nothing to guard)."""
+    if not chat_id or not title:
+        return
+    with _LOCK, _conn() as c:
+        c.execute(
+            "INSERT OR REPLACE INTO chat_titles(chat_id,title,updated_ts) VALUES(?,?,?)",
+            (str(chat_id), title, time.time()),
+        )
+
+
+def search_chat_titles(query: str, chat_ids: list[str] | None = None, limit: int = 20) -> list[dict]:
+    """FTS title search over every chat this plugin knows a display name
+    for — including one with zero ingested messages so far (see
+    upsert_chat_title's own docstring for why that case matters). Pass
+    ``chat_ids`` to restrict to a known set (e.g. the one chat_id a
+    client-mode session's telegram_search call is itself scoped to)."""
+    fts_query = _fts5_prefix_query(query)
+    if fts_query is None:
+        return []
+    where = "chat_titles_fts MATCH ?"
+    args: list = [fts_query]
+    if chat_ids:
+        placeholders = ",".join("?" for _ in chat_ids)
+        where += f" AND t.chat_id IN ({placeholders})"
+        args.extend(str(c) for c in chat_ids)
+    fetch_limit = max(1, min(int(limit), 200))
+    with _conn() as c:
+        rows = c.execute(
+            f"SELECT t.chat_id AS chat_id, t.title AS title FROM chat_titles_fts "
+            f"JOIN chat_titles t ON t.rowid = chat_titles_fts.rowid "
+            f"WHERE {where} LIMIT ?",
+            [*args, fetch_limit],
+        ).fetchall()
+    return [dict(r) for r in rows]
+
 
 def set_chat(chat_id: str, mode: str, title: str = "", added_by: str = "", program: str | None = None) -> None:
     import time
@@ -218,6 +297,7 @@ def set_chat(chat_id: str, mode: str, title: str = "", added_by: str = "", progr
             "VALUES(?,?,?,?,?,?)",
             (str(chat_id), mode, title, str(added_by), time.time(), program),
         )
+    upsert_chat_title(chat_id, title)
 
 
 def remove_chat(chat_id: str) -> bool:
@@ -284,7 +364,7 @@ def list_chats() -> list[dict]:
 _PROGRAM_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 
-def create_program(program: str, chat_id: str, created_by: str) -> bool:
+def create_program(program: str, chat_id: str, created_by: str, title: str = "") -> bool:
     """Bind ``program`` to ``chat_id`` as that program's team chat.
 
     Returns False (no-op) if ``program`` isn't lowercase-alnum/-/_ (matches
@@ -313,7 +393,8 @@ def create_program(program: str, chat_id: str, created_by: str) -> bool:
             "INSERT INTO partner_programs(program,chat_id,created_by,created_ts) VALUES(?,?,?,?)",
             (program, str(chat_id), str(created_by), time.time()),
         )
-        return True
+    upsert_chat_title(chat_id, title)
+    return True
 
 
 def programs() -> dict[str, str]:
